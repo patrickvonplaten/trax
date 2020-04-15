@@ -23,6 +23,7 @@ from trax import layers as tl
 from trax.math import numpy as np
 
 # pylint: disable=invalid-name
+load_checkpoint = tf.train.load_checkpoint
 
 
 class AddBias(tl.Layer):
