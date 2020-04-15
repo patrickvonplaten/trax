@@ -17,12 +17,13 @@
 """BERT."""
 
 import jax
-from tensorflow.train import load_checkpoint
+import tensorflow as tf
 
 from trax import layers as tl
 from trax.math import numpy as np
 
 # pylint: disable=invalid-name
+load_checkpoint = tf.train.load_checkpoint
 
 
 def _add_bias_weights(input_signature, **unused_wargs):
