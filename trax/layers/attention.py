@@ -42,6 +42,7 @@ def zero_pad(x, pad, axis):
 @base.layer()
 def ShiftRight(x, n_shifts=1, mode='train', **unused_kwargs):
   """Layer to shift the tensor to the right by padding on axis 1."""
+
   if mode == 'predict':
     # Do nothing in predict mode, as then the sequence length is 1.
     return x
