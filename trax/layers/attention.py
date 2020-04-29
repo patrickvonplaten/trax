@@ -33,7 +33,6 @@ from trax.math import numpy as jnp
 
 def Attention(d_feature, n_heads=1, dropout=0.0, mode='train'):
   """Transformer-style multi-headed attention.
-
   Accepts inputs of the form (x, mask) and constructs (q, k, v) from x.
 
   Args:

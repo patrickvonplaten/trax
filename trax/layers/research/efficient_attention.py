@@ -39,6 +39,8 @@ from jax.scipy.special import logsumexp
 from trax.layers import base
 from trax.math import numpy as np
 
+import numpy as onp
+
 
 ####################################################### Functions
 
@@ -1014,6 +1016,7 @@ class SelfAttention(EfficientAttentionBase):
   def incremental_forward_unbatched(self, x, mask=None, *,
                                     q_start, q_len,
                                     weights, state, rng, update_state):
+
     del update_state
     attend_rng, output_rng = jax.random.split(rng)
     if self.share_qk:
@@ -1085,6 +1088,7 @@ class LSHSelfAttention(SelfAttention):
                n_parallel_heads=1,
                use_python_loop=False,
                use_reference_code=False,
+               lsh_seed=False
               ):
     """Construct an LSH self-attention layer."""
     super().__init__(
@@ -1102,6 +1106,7 @@ class LSHSelfAttention(SelfAttention):
         )
     self.n_hashes = n_hashes
     self.n_buckets = n_buckets
+    self.lsh_seed = lsh_seed
 
   def create_state_unbatched(self, input_signature, rng):
     if isinstance(input_signature, (tuple, list)):
@@ -1142,6 +1147,11 @@ class LSHSelfAttention(SelfAttention):
 
     rng = jax.lax.stop_gradient(jax.lax.tie_in(vecs, rng))
     random_rotations = jax.random.normal(rng, rotations_shape).astype('float32')
+
+    if self.lsh_seed is not None:
+        onp.random.seed(self.lsh_seed)
+        random_rotations = jax.numpy.asarray(onp.random.normal(size=rotations_shape).astype('float32'))
+
     rotated_vecs = np.einsum('tf,fhb->htb', vecs, random_rotations)
 
     if isinstance(self.n_buckets, int) or len(self.n_buckets) == 1:
@@ -1233,9 +1243,17 @@ class LSHSelfAttention(SelfAttention):
   def incremental_forward_unbatched(self, x, *,
                                     q_start, q_len,
                                     weights, state, rng, update_state):
+
     assert update_state, (
         'This setting not supported (e.g. no backprop for fast inference)')
-    if isinstance(q_start, int) and q_start == 0 and q_len > 1:
+
+#    if x.__class__.__name__ != 'JaxprTracer':
+#        import ipdb
+#        ipdb.set_trace()
+
+# TODO(Patrick)
+#    if isinstance(q_start, int) and q_start == 0 and q_len > 1:
+    if q_len > 1:
       if x.shape[0] % self.chunk_len == 0:
         x_padded = x
       else:
