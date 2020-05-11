@@ -437,8 +437,9 @@ class Layer(object):
         # In this case, we're called for the first time: cache weights.
         self._weights = weights
 
-      # TODO (PVP):
-      if not self.has_backward or True:
+      # TODO(PVP):
+#      if not self.has_backward or True:
+      if not self.has_backward:
         outputs, s = self.forward_with_state(
             x, weights=weights, state=state, rng=rng)
       else:
