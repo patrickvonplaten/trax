@@ -40,6 +40,7 @@ import jax
 from trax import fastmath
 from trax.fastmath import numpy as np
 from trax.layers import base
+import numpy as onp
 
 
 ####################################################### Functions
@@ -977,6 +978,8 @@ class SelfAttention(EfficientAttentionBase):
 
   def forward_unbatched(self, x, mask=None, *,
                         weights, state, rng, update_state):
+#    if x.__class__.__name__ != "JaxprTracer":
+#        onp.save("/home/patrick/hugging_face/int_weights/hidden_states.npy", onp.asarray(x))
     del update_state
     attend_rng, output_rng = fastmath.random.split(rng)
     if self.bias:
@@ -1103,6 +1106,7 @@ class LSHSelfAttention(SelfAttention):
                use_python_loop=False,
                use_reference_code=False,
                max_length_for_buckets=None,
+               lsh_seed=False
               ):
     """Construct an LSH self-attention layer."""
     super().__init__(
@@ -1122,6 +1126,7 @@ class LSHSelfAttention(SelfAttention):
     self.n_hashes = n_hashes
     self.n_buckets = n_buckets
     self._max_length_for_buckets = max_length_for_buckets
+    self.lsh_seed = lsh_seed
 
   def create_state_unbatched(self, input_signature, rng):
     if isinstance(input_signature, (tuple, list)):
@@ -1162,6 +1167,11 @@ class LSHSelfAttention(SelfAttention):
     rng = fastmath.stop_gradient(tie_in(vecs, rng))
     random_rotations = fastmath.random.normal(rng, rotations_shape).astype(
         np.float32)
+
+    if self.lsh_seed is not None:
+      onp.random.seed(self.lsh_seed)
+      random_rotations = jax.numpy.asarray(onp.random.normal(size=rotations_shape).astype('float32'))
+
     if fastmath.backend_name() == 'jax':
       rotated_vecs = np.einsum('tf,fhb->htb', vecs, random_rotations)
     else:

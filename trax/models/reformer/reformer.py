@@ -221,7 +221,7 @@ class ReversibleHalfResidualV2(tl.ReversibleLayer):
 
 def DecoderBlock(d_model, d_ff, d_attention_key, d_attention_value,
                  n_heads, attention_type,
-                 dropout, ff_activation, ff_use_sru, ff_chunk_size, mode):
+                 dropout, ff_activation, ff_use_sru, ff_chunk_size, mode, is_decoder):
   """Reversible transformer decoder layer.
 
   Args:
@@ -242,7 +242,7 @@ def DecoderBlock(d_model, d_ff, d_attention_key, d_attention_value,
   """
   attention = attention_type(
       n_heads=n_heads, d_qk=d_attention_key, d_v=d_attention_value,
-      causal=True, output_dropout=dropout, mode=mode)
+      causal=is_decoder, output_dropout=dropout, mode=mode)
   attention_half_residual = ReversibleHalfResidualV2(
       tl.LayerNorm(),
       attention_layer=attention,
@@ -277,6 +277,7 @@ def ReformerLM(vocab_size,
                ff_activation=tl.FastGelu,
                ff_use_sru=0,
                ff_chunk_size=0,
+               is_decoder=False,
                mode='train'):
   """Reversible transformer language model (only uses a decoder, no encoder).
 
@@ -345,7 +346,8 @@ def ReformerLM(vocab_size,
         ff_activation=ff_activation,
         ff_use_sru=ff_use_sru,
         ff_chunk_size=ff_chunk_size,
-        mode=mode)
+        mode=mode,
+        is_decoder=is_decoder)
     decoder_blocks.append(decoder_block)
 
   return tl.Serial(
