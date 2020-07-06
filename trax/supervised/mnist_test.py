@@ -20,11 +20,10 @@ import itertools
 
 from absl.testing import absltest
 
-import gin
-
 from trax import layers as tl
 from trax.optimizers import adafactor
 from trax.supervised import inputs
+from trax.supervised import tf_inputs
 from trax.supervised import training
 
 
@@ -36,11 +35,6 @@ class MnistTest(absltest.TestCase):
     Evals for cross-entropy loss and accuracy are run every 50 steps;
     their values are visible in the test log.
     """
-    gin.parse_config([
-        'batch_fn.batch_size_per_device = 256',
-        'batch_fn.eval_batch_size = 256',
-    ])
-
     mnist_model = tl.Serial(
         tl.Flatten(),
         tl.Dense(512),
@@ -51,24 +45,27 @@ class MnistTest(absltest.TestCase):
         tl.LogSoftmax(),
     )
     task = training.TrainTask(
-        itertools.cycle(inputs.inputs('mnist').train_stream(1)),
+        itertools.cycle(_mnist_dataset().train_stream(1)),
         tl.CrossEntropyLoss(),
         adafactor.Adafactor(.02))
     eval_task = training.EvalTask(
-        itertools.cycle(inputs.inputs('mnist').eval_stream(1)),
-        [tl.CrossEntropyLoss(), tl.AccuracyScalar()],
-        names=['CrossEntropyLoss', 'AccuracyScalar'],
-        eval_at=lambda step_n: step_n % 50 == 0,
-        eval_N=10)
+        itertools.cycle(_mnist_dataset().eval_stream(1)),
+        [tl.CrossEntropyLoss(), tl.Accuracy()],
+        n_eval_batches=10)
 
-    training_session = training.Loop(mnist_model, task, eval_task=eval_task)
+    training_session = training.Loop(mnist_model, task, eval_task=eval_task,
+                                     eval_at=lambda step_n: step_n % 50 == 0)
+
     training_session.run(n_steps=1000)
-    self.assertEqual(training_session.current_step(), 1000)
+    self.assertEqual(training_session.current_step, 1000)
 
 
 def _mnist_dataset():
   """Loads (and caches) the standard MNIST data set."""
-  return inputs.inputs('mnist')
+  streams = tf_inputs.data_streams('mnist')
+  return inputs.batcher(streams, variable_shapes=False,
+                        batch_size_per_device=256,
+                        eval_batch_size=256)
 
 
 if __name__ == '__main__':

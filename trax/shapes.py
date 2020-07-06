@@ -15,11 +15,7 @@
 
 """Core class and functions for handling data abstractly as shapes/dtypes."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import numpy as onp
+import numpy as np
 import tensorflow as tf
 
 
@@ -30,7 +26,7 @@ class ShapeDtype(object):
   """
   __slots__ = ['shape', 'dtype']
 
-  def __init__(self, shape, dtype=onp.float32):
+  def __init__(self, shape, dtype=np.float32):
     """Creates a `ShapeDtype` instance, with canonicalized `shape` and `dtype`.
 
     Args:
@@ -71,27 +67,35 @@ class ShapeDtype(object):
   def as_tuple(self):
     return self.shape, self.dtype
 
+  def replace(self, **kwargs):
+    """Creates a copy of the object with some parameters replaced."""
+    return type(self)(
+        shape=kwargs.pop('shape', self.shape),
+        dtype=kwargs.pop('dtype', self.dtype),
+    )
+
 
 def signature(obj):
   """Returns a `ShapeDtype` signature for the given `obj`.
 
   A signature is either a `ShapeDtype` instance or a tuple of `ShapeDtype`
   instances. Note that this function is permissive with respect to its inputs
-  (accepts lists or tuples, and underlying objects can be any type as long as
-  they have shape and dtype attributes), but strict with respect to its outputs
-  (only `ShapeDtype`, and only tuples).
+  (accepts lists or tuples or dicts, and underlying objects can be any type
+  as long as they have shape and dtype attributes) and returns the corresponding
+  nested structure of `ShapeDtype`.
 
   Args:
-    obj: An object that has `shape` and `dtype` attributes, or a list/tuple
+    obj: An object that has `shape` and `dtype` attributes, or a list/tuple/dict
         of such objects.
 
   Returns:
-    A single `ShapeDtype` instance if the signature has one element, else a
-    tuple of `ShapeDtype` instances.
+    A corresponding nested structure of `ShapeDtype` instances.
   """
   if isinstance(obj, (list, tuple)):
     output = tuple(signature(x) for x in obj)
-    return output[0] if len(output) == 1 else output
+    return output if isinstance(obj, tuple) else list(output)
+  elif isinstance(obj, dict):
+    return {k: signature(v) for (k, v) in obj.items()}
   else:
     return ShapeDtype(obj.shape, obj.dtype)
 
@@ -101,8 +105,9 @@ def splice_signatures(*sigs):
 
   The splicing effectively flattens the top level input signatures. For
   instance, it would perform the following mapping:
-    - *sigs: sd1, (sd2, sd3, sd4), (), sd5
-    - return: (sd1, sd2, sd3, sd4, sd5)
+
+    - `*sigs: sd1, (sd2, sd3, sd4), (), sd5`
+    - return: `(sd1, sd2, sd3, sd4, sd5)`
 
   Args:
     *sigs: Any number of signatures. A signature is either a `ShapeDtype`

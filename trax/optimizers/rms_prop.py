@@ -16,7 +16,7 @@
 # Lint as: python3
 """RMSProp optimizer class."""
 
-from trax.math import numpy as np
+from trax.fastmath import numpy as jnp
 from trax.optimizers import base as opt_base
 
 
@@ -27,15 +27,17 @@ class RMSProp(opt_base.Optimizer):
   decaying average of gradients from prior training batches.
   """
 
-  def __init__(self, learning_rate, gamma=0.9, eps=1e-8):  # pylint: disable=useless-super-delegation
+  def __init__(self, learning_rate, gamma=0.9,
+               eps=1e-8, clip_grad_norm=None):  # pylint: disable=useless-super-delegation
     super(RMSProp, self).__init__(
         learning_rate=learning_rate,
         gamma=gamma,
         eps=eps,
+        clip_grad_norm=clip_grad_norm
     )
 
   def init(self, weights):
-    return np.ones_like(weights)
+    return jnp.ones_like(weights)
 
   def update(self, step, grads, weights, avg_sq_grad, opt_params):
     del step
@@ -44,5 +46,5 @@ class RMSProp(opt_base.Optimizer):
     eps = opt_params['eps']
     avg_sq_grad = avg_sq_grad * gamma + grads**2 * (1. - gamma)
     weights = weights - (lr * grads /
-                         (np.sqrt(avg_sq_grad) + eps)).astype(weights.dtype)
+                         (jnp.sqrt(avg_sq_grad) + eps)).astype(weights.dtype)
     return weights, avg_sq_grad

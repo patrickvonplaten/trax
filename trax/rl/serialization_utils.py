@@ -13,36 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Lint as: python3
 """Utilities for serializing trajectories into discrete sequences."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import functools
 
 import gym
-import numpy as onp
+import numpy as np
 
 from trax import layers as tl
-from trax.math import numpy as np
+from trax.fastmath import numpy as jnp
 from trax.rl import space_serializer
 
 
+# pylint: disable=invalid-name
 # TODO(pkozakowski): Move the layers to trax.layers and remove this module.
-@tl.layer()
-def Serialize(x, serializer, **unused_kwargs):
-  """Serializes a given array."""
-  (batch_size, length) = x.shape[:2]
-  shape_suffix = x.shape[2:]
-  x = np.reshape(x, (batch_size * length,) + shape_suffix)
-  x = serializer.serialize(x)
-  return np.reshape(x, (batch_size, -1, serializer.representation_length,))
+def Serialize(serializer):
+  """Layer that serializes a given array."""
+  def serialize(x):
+    (batch_size, length) = x.shape[:2]
+    shape_suffix = x.shape[2:]
+    x = jnp.reshape(x, (batch_size * length,) + shape_suffix)
+    x = serializer.serialize(x)
+    return jnp.reshape(x, (batch_size, -1, serializer.representation_length,))
+  return tl.Fn('Serialize', serialize)
 
 
-@tl.layer(n_in=2, n_out=1)
-def Interleave(inputs, **unused_kwargs):
-  """Interleaves and flattens two serialized sequences.
+def Interleave():
+  """Layer that interleaves and flattens two serialized sequences.
 
   The first sequence can be longer by 1 than the second one. This is so we can
   interleave sequences of observations and actions, when there's 1 extra
@@ -54,60 +52,63 @@ def Interleave(inputs, **unused_kwargs):
   x_L2_R1, y_L2_1, ..., y_L2_R2, x_L1_1, ..., x_L1_R1] (batch dimension omitted
   for clarity).
 
-  Args:
-    inputs: Pair of sequences of shapes (B, L1, R1) and (B, L2, R2), where B
-      is batch size, L* is the length of the sequence and R* is the
-      representation length of each element in the sequence.
+  The layer inputs are a sequence pair of shapes (B, L1, R1) and (B, L2, R2),
+  where B is batch size, L* is the length of the sequence and R* is the
+  representation length of each element in the sequence.
 
   Returns:
-    Interleaved sequence of shape (B, L1 * R1 + L2 * R2).
+    Layer that interleaves sequence of shape (B, L1 * R1 + L2 * R2).
   """
-  (x, y) = inputs
-  (batch_size, _, _) = x.shape
-  (_, length, _) = y.shape
-  assert x.shape[1] in (length, length + 1)
+  def interleave(x, y):
+    (batch_size, _, _) = x.shape
+    (_, length, _) = y.shape
+    assert x.shape[1] in (length, length + 1)
 
-  reprs = np.concatenate((x[:, :length], y), axis=2)
-  reprs = np.reshape(reprs, (batch_size, -1))
-  remainder = np.reshape(x[:, length:], (batch_size, -1))
-  return np.concatenate((reprs, remainder), axis=1)
-
-
-@tl.layer(n_in=1, n_out=2)
-def Deinterleave(inputs, x_size, y_size, **unused_kwargs):
-  """Inverse of Interleave."""
-  reprs = inputs
-  (batch_size, length) = reprs.shape[:2]
-  shape_suffix = reprs.shape[2:]
-  remainder_length = length % (x_size + y_size)
-  if remainder_length > 0:
-    remainder = reprs[:, None, -remainder_length:]
-    reprs = reprs[:, :-remainder_length]
-  reprs = np.reshape(reprs, (batch_size, -1, x_size + y_size) + shape_suffix)
-  x_reprs = reprs[:, :, :x_size]
-  y_reprs = reprs[:, :, x_size:]
-  if remainder_length > 0:
-    x_reprs = np.concatenate((x_reprs, remainder), axis=1)
-  return (x_reprs, y_reprs)
+    reprs = jnp.concatenate((x[:, :length], y), axis=2)
+    reprs = jnp.reshape(reprs, (batch_size, -1))
+    remainder = jnp.reshape(x[:, length:], (batch_size, -1))
+    return jnp.concatenate((reprs, remainder), axis=1)
+  return tl.Fn('Interleave', interleave)
 
 
-@tl.layer()
-def RepresentationMask(mask, serializer, **unused_kwargs):
+def Deinterleave(x_size, y_size):
+  """Layer that does the inverse of Interleave."""
+  def deinterleave(inputs):
+    reprs = inputs
+    (batch_size, length) = reprs.shape[:2]
+    shape_suffix = reprs.shape[2:]
+    remainder_length = length % (x_size + y_size)
+    if remainder_length > 0:
+      remainder = reprs[:, None, -remainder_length:]
+      reprs = reprs[:, :-remainder_length]
+    reprs = jnp.reshape(reprs, (batch_size, -1, x_size + y_size) + shape_suffix)
+    x_reprs = reprs[:, :, :x_size]
+    y_reprs = reprs[:, :, x_size:]
+    if remainder_length > 0:
+      x_reprs = jnp.concatenate((x_reprs, remainder), axis=1)
+    return (x_reprs, y_reprs)
+  return tl.Fn('Deinterleave', deinterleave, n_out=2)
+
+
+def RepresentationMask(serializer):
   """Upsamples a mask to cover the serialized representation."""
   # Trax enforces the mask to be of the same size as the target. Get rid of the
   # extra dimensions.
-  mask = np.amax(mask, axis=tuple(range(2, mask.ndim)))
-  return np.broadcast_to(
-      mask[:, :, None], mask.shape + (serializer.representation_length,)
-  )
+  def representation_mask(mask):
+    mask = jnp.amax(mask, axis=tuple(range(2, mask.ndim)))
+    return jnp.broadcast_to(
+        mask[:, :, None], mask.shape + (serializer.representation_length,)
+    )
+  return tl.Fn('RepresentationMask', representation_mask)
 
 
-@tl.layer()
-def SignificanceWeights(mask, serializer, decay, **unused_kwargs):
+def SignificanceWeights(serializer, decay):
   """Multiplies a binary mask with a symbol significance mask."""
-  # (repr,) -> (batch, length, repr)
-  significance = serializer.significance_map[None, None]
-  return mask * decay ** np.broadcast_to(significance, mask.shape)
+  def significance_weights(mask):
+    # (repr,) -> (batch, length, repr)
+    significance = serializer.significance_map[None, None]
+    return mask * decay ** jnp.broadcast_to(significance, mask.shape)
+  return tl.Fn('SignificanceWeights', significance_weights)
 
 
 def SerializedModel(
@@ -140,32 +141,30 @@ def SerializedModel(
     representation, obs_repr is the target observation representation and
     weights are the target weights.
   """
-  weigh_by_significance = [     # (mask,)
-      RepresentationMask(  # pylint: disable=no-value-for-parameter
-          serializer=observation_serializer,
-      ),                        # (repr_mask)
-      SignificanceWeights(  # pylint: disable=no-value-for-parameter
-          serializer=observation_serializer,
-          decay=significance_decay,
-      ),                        # (mask, sig_weights)
+  weigh_by_significance = [
+      # (mask,)
+      RepresentationMask(serializer=observation_serializer),
+      # (repr_mask)
+      SignificanceWeights(serializer=observation_serializer,
+                          decay=significance_decay),
+      # (mask, sig_weights)
   ]
-  return tl.Serial([            # (obs, act, obs, mask)
-      tl.Parallel(
-          Serialize(serializer=observation_serializer),  # pylint: disable=no-value-for-parameter
-          Serialize(serializer=action_serializer),  # pylint: disable=no-value-for-parameter
-          Serialize(serializer=observation_serializer),  # pylint: disable=no-value-for-parameter
-      ),                        # (obs_repr, act_repr, obs_repr, mask)
-      Interleave(  # pylint: disable=no-value-for-parameter
-      ),                        # (obs_act_repr, obs_repr, mask)
-      seq_model,                # (obs_act_logits, obs_repr, mask)
-      Deinterleave(  # pylint: disable=no-value-for-parameter
-          x_size=observation_serializer.representation_length,
-          y_size=action_serializer.representation_length,
-      ),                        # (obs_logits, act_logits, obs_repr, mask)
-      tl.Parallel(
-          None, tl.Drop(), None, weigh_by_significance
-      ),                        # (obs_logits, obs_repr, weights)
-  ])
+  return tl.Serial(
+      # (obs, act, obs, mask)
+      tl.Parallel(Serialize(serializer=observation_serializer),
+                  Serialize(serializer=action_serializer),
+                  Serialize(serializer=observation_serializer)),
+      # (obs_repr, act_repr, obs_repr, mask)
+      Interleave(),
+      # (obs_act_repr, obs_repr, mask)
+      seq_model,
+      # (obs_act_logits, obs_repr, mask)
+      Deinterleave(x_size=observation_serializer.representation_length,
+                   y_size=action_serializer.representation_length),
+      # (obs_logits, act_logits, obs_repr, mask)
+      tl.Parallel(None, tl.Drop(), None, weigh_by_significance),
+      # (obs_logits, obs_repr, weights)
+  )
 
 
 # TODO(pkozakowski): Figure out a more generic way to do this (submodel tags
@@ -195,27 +194,27 @@ def RawPolicy(seq_model, n_controls, n_actions):
       act_logits: (batch_size, length, n_controls, n_actions)
       values: (batch_size, length)
   """
-  @tl.layer()
-  def SplitControls(x, **unused_kwargs):  # pylint: disable=invalid-name
+
+  def SplitControls():  # pylint: disable=invalid-name
     """Splits logits for actions in different controls."""
-    return np.reshape(x, x.shape[:2] + (n_controls, n_actions))
+    def f(x):
+      return jnp.reshape(x, x.shape[:2] + (n_controls, n_actions))
+    return tl.Fn('SplitControls', f)
 
   action_head = [
       # Predict all action logits at the same time.
       tl.Dense(n_controls * n_actions),
       # Then group them into separate controls, adding a new dimension.
-      SplitControls(),  # pylint: disable=no-value-for-parameter
+      SplitControls(),
       tl.LogSoftmax(),
   ]
-  return tl.Serial([            # (obs, act)
-      tl.Select([0], n_in=2),   # (obs,)
-      seq_model,                # (obs_hidden,)
-      tl.Dup(),                 # (obs_hidden, obs_hidden)
-      tl.Parallel(
-          action_head,
-          [tl.Dense(1), tl.Flatten()],
-      )                         # (act_logits, values)
-  ])
+  return tl.Serial(                             # (obs, act)
+      tl.Select([0], n_in=2),                   # (obs,)
+      seq_model,                                # (obs_hidden,)
+      tl.Dup(),                                 # (obs_hidden, obs_hidden)
+      tl.Parallel(action_head, [tl.Dense(1),
+                                tl.Flatten()])  # (act_logits, values)
+  )
 
 
 def substitute_inner_policy_raw(raw_policy, inner_policy):  # pylint: disable=invalid-name
@@ -253,16 +252,15 @@ def SerializedPolicy(
         )
     )
 
-  @tl.layer()
-  def FirstSymbol(x, **unused_kwargs):
-    return x[:, :, 0]
+  def FirstSymbol():
+    return tl.Fn('FirstSymbol', lambda x: x[:, :, 0])
 
-  @tl.layer()
-  def PadRight(x, n_to_pad, **unused_kwargs):
-    pad_widths = [(0, 0), (0, n_to_pad)] + [(0, 0)] * (x.ndim - 2)
-    return np.pad(
-        x, pad_widths, mode='constant', constant_values=x.dtype.type(0)
-    )
+  def PadRight(n_to_pad):
+    def pad_right(x):
+      pad_widths = [(0, 0), (0, n_to_pad)] + [(0, 0)] * (x.ndim - 2)
+      return jnp.pad(
+          x, pad_widths, mode='constant', constant_values=x.dtype.type(0))
+    return tl.Fn(f'PadRight({n_to_pad})', pad_right)
 
   action_head = [
       tl.Dense(n_actions),
@@ -270,36 +268,37 @@ def SerializedPolicy(
   ]
   value_head = [
       # Take just the vectors corresponding to the first action symbol.
-      FirstSymbol(),  # pylint: disable=no-value-for-parameter
+      FirstSymbol(),
       # Predict values.
       tl.Dense(1),
       # Get rid of the singleton dimension.
       tl.Flatten(),
   ]
-  return tl.Serial([            # (obs, act)
-      tl.Parallel(
-          Serialize(serializer=observation_serializer),  # pylint: disable=no-value-for-parameter
-          Serialize(serializer=action_serializer),  # pylint: disable=no-value-for-parameter
-      ),                        # (obs_repr, act_repr)
-      Interleave(  # pylint: disable=no-value-for-parameter
-      ),                        # (obs_act_repr,)
+  return tl.Serial(
+      # (obs, act)
+      tl.Parallel(Serialize(observation_serializer),
+                  Serialize(action_serializer)),
+      # (obs_repr, act_repr)
+      Interleave(),
+      # (obs_act_repr,)
+
       # Add one dummy action to the right - we'll use the output at its first
       # symbol to predict the value for the last observation.
-      PadRight(n_to_pad=action_serializer.representation_length),  # pylint: disable=no-value-for-parameter
+      PadRight(action_serializer.representation_length),
+
       # Shift one symbol to the right, so we predict the n-th action symbol
       # based on action symbols 1..n-1 instead of 1..n.
       tl.ShiftRight(),
-      seq_model,                # (obs_act_hidden,)
-      Deinterleave(  # pylint: disable=no-value-for-parameter
-          x_size=observation_serializer.representation_length,
-          y_size=action_serializer.representation_length,
-      ),                        # (obs_hidden, act_hidden)
-      tl.Select([1]),           # (act_hidden,)
-      tl.Dup(),                 # (act_hidden, act_hidden)
-      tl.Parallel(
-          action_head, value_head
-      )                         # (act_logits, values)
-  ])
+      seq_model,
+      # (obs_act_hidden,)
+      Deinterleave(observation_serializer.representation_length,
+                   action_serializer.representation_length),
+      # (obs_hidden, act_hidden)
+      tl.Select([1, 1]),
+      # (act_hidden, act_hidden)
+      tl.Parallel(action_head, value_head),
+      # (act_logits, values)
+  )
 
 
 def substitute_inner_policy_serialized(serialized_policy, inner_policy):  # pylint: disable=invalid-name
@@ -320,7 +319,7 @@ def analyze_action_space(action_space):  # pylint: disable=invalid-name
   else:
     (n_controls,) = action_space.nvec.shape
     assert n_controls > 0
-    assert onp.min(action_space.nvec) == onp.max(action_space.nvec), (
+    assert np.min(action_space.nvec) == np.max(action_space.nvec), (
         'Every control must have the same number of actions.'
     )
     n_actions = action_space.nvec[0]
@@ -345,11 +344,9 @@ def wrap_policy(seq_model, observation_space, action_space, vocab_size):  # pyli
   else:
     obs_serializer = space_serializer.create(observation_space, vocab_size)
     act_serializer = space_serializer.create(action_space, vocab_size)
-    policy_wrapper = functools.partial(
-        SerializedPolicy,
-        observation_serializer=obs_serializer,
-        action_serializer=act_serializer,
-    )
+    policy_wrapper = functools.partial(SerializedPolicy,
+                                       observation_serializer=obs_serializer,
+                                       action_serializer=act_serializer)
   return policy_wrapper(seq_model, n_controls, n_actions)
 
 

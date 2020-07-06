@@ -21,7 +21,7 @@ from setuptools import setup
 
 setup(
     name='trax',
-    version='1.2.3',
+    version='1.3.1',
     description='Trax',
     long_description=(
         'Trax helps you understand deep learning. We start with basic maths and'
@@ -35,28 +35,32 @@ setup(
     license='Apache 2.0',
     packages=find_packages(),
     install_requires=[
+        'absl-py',
+        'funcsigs',
         'gin-config',
         'gym',
+        'jax',
+        'jaxlib',
         'numpy',
         'scipy',
         'six',
-        'jax',
-        'jaxlib',
+        't5',
         'tensor2tensor',
         'tensorflow-datasets',
-        'absl-py',
-        'funcsigs'
+        'tensorflow-text',
     ],
     extras_require={
-        'tensorflow': ['tensorflow>=1.14.0'],
-        'tensorflow_gpu': ['tensorflow-gpu>=1.14.0'],
+        'tensorflow': ['tensorflow>=1.15.0'],
+        'tensorflow_gpu': ['tensorflow-gpu>=1.15.0'],
         'tests': [
             'attrs',
-            'pytest',
-            'mock',
-            'pylint',
             'jupyter',
             'matplotlib',
+            'mock',
+            'parameterized',
+            'pylint',
+            'pytest',
+            'wrapt==1.11.*',
         ],
     },
     classifiers=[

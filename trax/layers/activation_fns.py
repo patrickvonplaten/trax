@@ -23,82 +23,181 @@ practice of separating the activation function as its own layer, which enables
 easier experimentation across different activation functions.
 """
 
-from trax import math
+from trax import fastmath
+from trax.fastmath import numpy as jnp
 from trax.layers import base
-from trax.math import numpy as np
+from trax.layers.base import Fn
 
 
-@base.layer()
-def Relu(x, **unused_kwargs):
-  return np.maximum(x, np.zeros_like(x))
+def Relu():
+  r"""Returns a layer that computes the Rectified Linear Unit (ReLU) function.
+
+  .. math::
+      f(x) = \left\{ \begin{array}{cl}
+          0 & \text{if}\ x \leq 0, \\
+          x & \text{otherwise}.
+      \end{array} \right.
+  """
+  return Fn('Relu', lambda x: jnp.where(x <= 0, jnp.zeros_like(x), x))
 
 
-@base.layer()
-def ParametricRelu(x, a=1., **unused_kwargs):
-  return np.maximum(a * x, np.zeros_like(x))
+def ParametricRelu(a=1.):
+  r"""Returns a layer that computes a ReLU function with the given slope.
+
+  .. math::
+      f(x) = \left\{ \begin{array}{cl}
+          0  & \text{if}\ x \leq 0, \\
+          ax & \text{otherwise}.
+      \end{array} \right.
+
+  Args:
+    a: Slope of line for positive inputs.
+  """
+  return Fn('ParametricRelu', lambda x: jnp.maximum(a * x, jnp.zeros_like(x)))
 
 
-@base.layer()
-def LeakyRelu(x, a=0.01, **unused_kwargs):
-  return np.where(x >= 0, x, a * x)
+def LeakyRelu(a=0.01):
+  r"""Returns a ReLU-like layer with linear nonzero outputs for negative inputs.
+
+  .. math::
+      f(x) = \left\{ \begin{array}{cl}
+          ax & \text{if}\ x \leq 0, \\
+          x  & \text{otherwise}.
+      \end{array} \right.
+
+  Args:
+    a: Slope of line for negative inputs.
+  """
+  return Fn('LeakyRelu', lambda x: jnp.where(x >= 0, x, a * x))
 
 
-@base.layer()
-def Elu(x, a=1., **unused_kwargs):
-  return np.where(x > 0, x, a * np.expm1(x))
+def Elu(a=1.):
+  r"""Returns a ReLU-like layer with exponential outputs for negative inputs.
+
+  .. math::
+      f(x) = \left\{ \begin{array}{cl}
+          a \cdot (e^x - 1) & \text{if}\ x \leq 0, \\
+          x                 & \text{otherwise}.
+      \end{array} \right.
+
+  (Asymptotically, :math:`f(x)\rightarrow -a` as :math:`x\rightarrow - \infty`.)
+
+  Args:
+    a: Coefficient multiplying the exponential, for negative inputs.
+  """
+  return Fn('Elu', lambda x: jnp.where(x > 0, x, a * jnp.expm1(x)))
 
 
-@base.layer()
-def Selu(x,
-         alpha=1.6732632423543772848170429916717,
+def Selu(alpha=1.6732632423543772848170429916717,
          lmbda=1.0507009873554804934193349852946):
-  return lmbda * np.where(x > 0, x, alpha * np.expm1(x))
+  r"""Returns an `Elu`-like layer with an additional scaling/slope parameter.
+
+  .. math::
+      f(x) = \left\{ \begin{array}{cl}
+          \lambda \cdot \alpha \cdot (e^x - 1) & \text{if}\ x \leq 0, \\
+          \lambda \cdot x                      & \text{otherwise}.
+      \end{array} \right.
+
+  Args:
+    alpha: Coefficient multiplying the exponential, for negative inputs.
+    lmbda: Coefficient scaling the whole function.
+  """
+  return Fn('Selu', lambda x: lmbda * jnp.where(x > 0, x, alpha * jnp.expm1(x)))
 
 
-@base.layer()
-def Gelu(x, **unused_kwargs):
-  return x * 0.5 * (1.0 + math.erf(x / np.sqrt(2.0)))
+def Gelu():
+  r"""Returns a layer that computes the Gaussian Error Linear Unit function.
+
+  .. math::
+      f(x) = \frac{x}{2} \cdot (1 + \hbox{erf}(\frac{x}{\sqrt{2}}))
+  """
+  return Fn('Gelu', lambda x: x * 0.5 * (1.0 + fastmath.erf(x / jnp.sqrt(2.0))))
 
 
-@base.layer()
-def FastGelu(x, **unused_kwargs):
-  return 0.5 * x * (1 + np.tanh(x * 0.7978845608 * (1 + 0.044715 * x * x)))
+def FastGelu():
+  r"""Returns a layer that computes a fast approximation to `Gelu`.
+
+  .. math::
+      f(x) = \frac{x}{2} \cdot (1 + \tanh(ax + abx^3))
+
+  where :math:`a = 0.7978845608` and :math:`b = 0.044715`.
+  """
+  def f(x):  # pylint: disable=invalid-name
+    return 0.5 * x * (1 + jnp.tanh(x * 0.7978845608 * (1 + 0.044715 * x * x)))
+  return Fn('FastGelu', f)
 
 
-@base.layer()
-def Sigmoid(x, **unused_kwargs):
-  return math.expit(x)
+# pylint: disable=unnecessary-lambda
+def Sigmoid():
+  r"""Returns a layer that computes the sigmoid function.
+
+  .. math::
+      f(x) = \frac{1}{1 + e^{-x}}
+  """
+  return Fn('Sigmoid', lambda x: fastmath.expit(x))
 
 
-@base.layer()
-def Tanh(x, **unused_kwargs):
-  return np.tanh(x)
+def Tanh():
+  r"""Returns a layer that computes the hyperbolic tangent function.
+
+  .. math::
+      f(x) = \frac{e^x - e^{-x}}{e^x + e^{-x}}
+  """
+  return Fn('Tanh', lambda x: jnp.tanh(x))
+# pylint: enable=unnecessary-lambda
 
 
-@base.layer()
-def HardSigmoid(x, **unused_kwargs):
-  """Computes a linear approximation to sigmoid."""
-  return np.maximum(0, np.minimum(1, (1 + x)))
+def HardSigmoid():
+  r"""Returns a layer that computes a linear approximation to `Sigmoid`.
+
+  .. math::
+      f(x) = \left\{ \begin{array}{cl}
+          0 & \text{if}\ x \leq 0, \\
+          x & \text{if}\ 0 < x < 1, \\
+          1 & \text{otherwise}.
+      \end{array} \right.
+  """
+  return Fn('HardSigmoid', lambda x: jnp.maximum(0, jnp.minimum(1, (1 + x))))
 
 
-@base.layer()
-def HardTanh(x, **unused_kwargs):
-  """Computes a linear approximation to tanh."""
-  return np.maximum(-1, np.minimum(1, x))
+def HardTanh():
+  r"""Returns a layer that computes a linear approximation to `Tanh`.
+
+  .. math::
+      f(x) = \left\{ \begin{array}{cl}
+          -1 & \text{if}\ x \leq 0, \\
+          x  & \text{if}\ -1 < x < 1, \\
+          1  & \text{otherwise}.
+      \end{array} \right.
+  """
+  return Fn('HardTanh', lambda x: jnp.maximum(-1, jnp.minimum(1, x)))
 
 
-@base.layer()
-def Softplus(x, **unused_kwargs):
-  return np.logaddexp(x, 0.)
+def Softplus():
+  r"""Returns a layer that computes the softplus function.
+
+  .. math::
+      f(x) = \ln(e^x + 1)
+  """
+  return Fn('Softplus', lambda x: jnp.logaddexp(x, 0.))
 
 
 class ThresholdedLinearUnit(base.Layer):
   """Thresholded Linear Unit, c.f. https://arxiv.org/pdf/1911.09737.pdf ."""
 
-  def new_weights(self, input_signature):
+  def init_weights_and_state(self, input_signature):
+    """Initializes this layer's single weight to zero."""
     del input_signature
-    return (np.zeros((), dtype=np.float32),)
+    self.weights = jnp.zeros((), dtype=jnp.float32)
 
-  def forward(self, inputs, weights):
-    threshold = weights[0]
-    return np.maximum(inputs, threshold)
+  def forward(self, inputs):
+    """Executes this layer as part of a forward pass through the model.
+
+    Args:
+      inputs: Tensor.
+
+    Returns:
+      Tensor of same shape and dtype as the input.
+    """
+    threshold = self.weights
+    return jnp.maximum(inputs, threshold)

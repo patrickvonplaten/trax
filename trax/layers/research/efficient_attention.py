@@ -13,1139 +13,1463 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Attention Layers optimized for efficiency."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+# Lint as: python3
+"""Attention Layers optimized for efficiency (second-pass implementation).
 
-import math as python_math
-import random
+The approach taken in the first round of efficient attention implementations
+revealed several limitations, which this code attempts to address:
 
+1. Simultaneously instantiating queries, keys, and values for all heads can
+   exceed the memory budget. Transformers are typically tuned such that
+   n_heads * d_attention_key == d_model. Since attention involves queries, keys,
+   AND values, the memory to store them can be ~3x the memory needed to store
+   the input activations. Once the O(n^2) dot-product bottleneck is removed
+   -- as is the case in all of our efficient attention implementations -- this
+   becomes the next critical bottleneck for scaling up Transformer models.
+
+2. Attention masking is implemented by associating an integer (typically, the
+   sequence position) with each query and key vector, and defining a function
+   to compute attention masks from this information. The standard attention API
+   (attention.py) is unscalable because it instantiates O(n^2)-size attention
+   masks, and the previous efficient implementations (efficient_attention.py)
+   only supported causal masking.
+"""
+import functools
 import jax
 
-from trax import math
-from trax.layers import attention
+from trax import fastmath
+from trax.fastmath import numpy as np
 from trax.layers import base
-from trax.math import numpy as np
-
-# pylint: disable=protected-access
-_fast_inference_init_state = attention._fast_inference_init_state
-_fast_inference_update_state = attention._fast_inference_update_state
-# pylint: enable=protected-access
-
-# Layers are always CamelCase, but functions in general are snake_case
-# pylint: disable=invalid-name
 
 
-class MemoryEfficientCausalAttention(attention.BaseCausalAttention):
-  """Memory-efficient dot product attention.
+####################################################### Functions
 
-  This layer performs causal attention on long sequences without running out
-  of memory. Instead of computing dot products for all query-key pairs at once,
-  it uses a loop to compute attention for a small set of query positions at a
-  time. The "loop_stride" parameter controls how many query positions are
-  considered at each iteration of the loop.
 
-  Note that this class does not slice along the batch/head dimension. Looping
-  over batch elements and heads instead of query positions is also a viable
-  option. We haven't implemented it, but it may perform well, too.
+def tie_in(x, y):
+  if fastmath.backend_name() == 'jax':
+    return jax.lax.tie_in(x, y)
+  return y
+
+
+def length_normalized(x, epsilon=1e-6):
+  variance = np.mean(x**2, axis=-1, keepdims=True)
+  norm_inputs = x / np.sqrt(variance + epsilon)
+  return norm_inputs
+
+
+def look_adjacent(x, n_chunks_before, n_chunks_after):
+  """Used to implement attention between consecutive chunks.
+
+  Args:
+    x: array of shape [n_chunks, chunk_len, ...]
+    n_chunks_before: Number of previous chunks to attend to.
+    n_chunks_after: Number of subsequent chunks to attend to.
+  Returns:
+    array of shape [n_chunks, N * chunk_len, ...], where
+    N = (1 + n_chunks_before + n_chunks_after).
+  """
+  if n_chunks_before == 0 and n_chunks_after == 0:
+    return x
+
+  slices = []
+  for i in range(-n_chunks_before, n_chunks_after + 1):
+    if i == 0:
+      slices.append(x)
+    else:
+      slices.append(np.concatenate([x[i:, ...], x[:i, ...]], axis=0))
+  return np.concatenate(slices, axis=1)
+
+
+def mask_self_attention(
+    dots, q_info, kv_info, causal=True, exclude_self=True, masked=False):
+  """Performs masking for self-attention."""
+  if causal:
+    mask = fastmath.lt(q_info, kv_info).astype(np.float32)
+    dots = dots - 1e9 * mask
+  if exclude_self:
+    mask = np.equal(q_info, kv_info).astype(np.float32)
+    dots = dots - 1e5 * mask
+  if masked:
+    zeros_like_kv_info = tie_in(kv_info, np.zeros_like(kv_info))
+    mask = fastmath.lt(kv_info, zeros_like_kv_info).astype(np.float32)
+    dots = dots - 1e9 * mask
+  return dots
+
+
+def attend(
+    q, k=None, v=None,
+    q_chunk_len=None, kv_chunk_len=None,
+    n_chunks_before=0, n_chunks_after=0,
+    mask_fn=None, q_info=None, kv_info=None,
+    dropout=0.0, rng=None,
+    ):
+  """Dot-product attention, with optional chunking and/or masking.
+
+  Args:
+    q: Query vectors, shape [q_len, d_qk]
+    k: Key vectors, shape [kv_len, d_qk]; or None
+    v: Value vectors, shape [kv_len, d_v]
+    q_chunk_len: Set to non-zero to enable chunking for query vectors
+    kv_chunk_len: Set to non-zero to enable chunking for key/value vectors
+    n_chunks_before: Number of adjacent previous chunks to attend to
+    n_chunks_after: Number of adjacent subsequent chunks to attend to
+    mask_fn: TODO(kitaev) doc
+    q_info: Query-associated metadata for masking
+    kv_info: Key-associated metadata for masking
+    dropout: Dropout rate
+    rng: RNG for dropout
+
+  Returns:
+    A tuple (output, dots_logsumexp). The output has shape [q_len, d_v], and
+    dots_logsumexp has shape [q_len]. The logsumexp of the attention
+    probabilities is useful for combining multiple rounds of attention (as in
+    LSH attention).
+  """
+  assert v is not None
+  share_qk = (k is None)
+
+  if q_info is None:
+    q_info = np.arange(q.shape[-2])
+
+  if kv_info is None and not share_qk:
+    kv_info = np.arange(v.shape[-2])
+
+  # Split q/k/v into chunks along the time axis, if desired.
+  if q_chunk_len is not None:
+    q = np.reshape(q, (-1, q_chunk_len, q.shape[-1]))
+    q_info = np.reshape(q_info, (-1, q_chunk_len))
+
+  if share_qk:
+    assert kv_chunk_len is None or kv_chunk_len == q_chunk_len
+    k = q
+    kv_chunk_len = q_chunk_len
+    if kv_info is None:
+      kv_info = q_info
+    elif kv_chunk_len is not None:
+      # kv_info is not None, but reshape as required.
+      kv_info = np.reshape(kv_info, (-1, kv_chunk_len))
+  elif kv_chunk_len is not None:
+    k = np.reshape(k, (-1, kv_chunk_len, k.shape[-1]))
+    kv_info = np.reshape(kv_info, (-1, kv_chunk_len))
+
+  if kv_chunk_len is not None:
+    v = np.reshape(v, (-1, kv_chunk_len, v.shape[-1]))
+
+  if share_qk:
+    k = length_normalized(k)
+  k = k / np.sqrt(k.shape[-1])
+
+  # Optionally include adjacent chunks.
+  if q_chunk_len is not None or kv_chunk_len is not None:
+    assert q_chunk_len is not None and kv_chunk_len is not None
+  else:
+    assert n_chunks_before == 0 and n_chunks_after == 0
+
+  k = look_adjacent(k, n_chunks_before, n_chunks_after)
+  v = look_adjacent(v, n_chunks_before, n_chunks_after)
+  kv_info = look_adjacent(kv_info, n_chunks_before, n_chunks_after)
+
+  # Dot-product attention.
+  dots = np.matmul(q, np.swapaxes(k, -1, -2))
+
+  # Masking
+  if mask_fn is not None:
+    dots = mask_fn(dots, q_info[..., :, None], kv_info[..., None, :])
+
+  # Softmax.
+  dots_logsumexp = fastmath.logsumexp(dots, axis=-1, keepdims=True)
+  dots = np.exp(dots - dots_logsumexp)
+
+  if dropout > 0.0:
+    assert rng is not None
+    # Dropout is broadcast across the bin dimension
+    dropout_shape = (dots.shape[-2], dots.shape[-1])
+    # TODO(kitaev): verify that tie-in is safe to remove (in light of jax fix)
+    keep_prob = tie_in(dots, 1.0 - dropout)
+    keep = fastmath.random.bernoulli(rng, keep_prob, dropout_shape)
+    multiplier = keep.astype(dots.dtype) / tie_in(keep, keep_prob)
+    dots = dots * multiplier
+
+  # The softmax normalizer (dots_logsumexp) is used by multi-round LSH attn.
+  out = np.matmul(dots, v)
+  out = np.reshape(out, (-1, out.shape[-1]))
+  dots_logsumexp = np.reshape(dots_logsumexp, (-1,))
+  return out, dots_logsumexp
+
+
+def apply_broadcasted_dropout(vecs, dropout_rate, rng):
+  """Apply dropout, broadcasted across all but the last dimension of `vecs`."""
+  if dropout_rate > 0.0:
+    assert rng is not None
+    keep_prob = tie_in(vecs, 1.0 - dropout_rate)
+    keep = fastmath.random.bernoulli(rng, keep_prob, (vecs.shape[-1],))
+    multiplier = keep.astype(vecs.dtype) / tie_in(keep, keep_prob)
+    return vecs * multiplier
+  else:
+    return vecs
+
+
+def permute_via_gather(val, permutation, inverse_permutation, axis=0):
+  """Permutation helper for LSH attention."""
+  def permute_impl(val):
+    return np.take(val, permutation, axis=axis)
+  def permute_vjp(val):
+    permuted = permute_impl(fastmath.stop_gradient(val))
+    def vjpfun(permuted_grad):
+      # JAX autodiff would synthesize a scatter operation because it doesn't
+      # know that the indices are a permutatation. However on TPU, gathers are
+      # faster than scatters (at least in the regime the LSH attention uses).
+      return (np.take(permuted_grad, inverse_permutation, axis=axis),)
+    return permuted, vjpfun
+  permute = fastmath.custom_grad(permute_vjp, permute_impl)
+  return permute(val)
+
+
+def permute_via_sort(val, keys, inverse_keys, axis=0):
+  """Permutation helper for LSH attention."""
+  def permute_impl(val):
+    # On TPU, sorting scalars by key is faster than a gather.
+    _, permuted = fastmath.sort_key_val(keys, val, dimension=axis)
+    return permuted
+  def permute_vjp(val):
+    permuted = permute_impl(fastmath.stop_gradient(val))
+    def vjpfun(permuted_grad):
+      _, val_grad = fastmath.sort_key_val(
+          inverse_keys, permuted_grad, dimension=axis)
+      return (val_grad,)
+    return permuted, vjpfun
+  permute = fastmath.custom_grad(permute_vjp, permute_impl)
+  return permute(val)
+
+
+####################################################### Classes
+
+
+class EfficientAttentionBase(base.Layer):
+  """Base class for efficient attention.
+
+  This is a base class that implements memory-efficient batching for both the
+  forward and backward passes. Subclasses should override
+  `create_weights_unbatched`, `create_state_unbatched`, `forward_unbatched`, and
+  optionally `incremental_forward_unbatched` to define the actual attention
+  mechanism.
   """
 
-  def __init__(self, loop_stride, dropout, mode, share_qk=False, hard_k=0):
-    assert math.backend_name() == 'jax', (
-        'JAX backend is required to use MemoryEfficientCausalAttention.')
-    super(MemoryEfficientCausalAttention, self).__init__()
-    self._loop_stride = loop_stride
-    if dropout >= 1.0:
-      raise ValueError('Dropout rates must be lower than 1.')
-    if mode == 'train':
-      self.dropout = dropout
+  def __init__(self, n_heads, n_in=1, n_parallel_heads=None,
+               incremental=False, predict_mem_len=None, predict_drop_len=None,
+               use_python_loop=False, use_reference_code=False):
+    """Constructs an EfficientAttentionBase instance.
+
+    Args:
+      n_heads: Number of attention heads.
+      n_in: Number of inputs to the layer (default 1).
+      n_parallel_heads: Number of attention heads to compute in parallel.
+
+          - If `n_parallel_heads` is None (default), the entire layer is
+            computed with maximum parallelism. This mode is the fastest, but
+            also uses the most memory. Start with this mode, but switch to one
+            of the others if memory runs out.
+          - If `n_parallel_heads` is 1, attention is computed one head at a
+            time, and one example at a time. This mode uses the least memory
+            but is not as fast as batched attention. Use this mode when working
+            with very long sequences, such that any amount of parallelism won't
+            fit in memory.
+          - If `n_parallel_heads` is a multiple of `n_heads`, attention is
+            computed for sub-batches of (`n_parallel_heads // n_heads`)
+            examples at a time.
+          - If `1 < n_parallel_heads < n_heads`, attention is computed for
+            several heads at a time, but only within a single example. It must
+            be the case that `n_heads` is a multiple of `n_parallel_heads`. Use
+            this mode for long sequences, to strike a balance between
+            parallelism and memory usage.
+      incremental: If `True`, enable fast inference for self-attention types.
+          Note that this flag should *not* be set when doing encoder-decoder
+          attention, but only when doing self-attention.
+      predict_mem_len: Number of input positions to remember in a cache
+          when doing fast inference. Whenever the cache fills up, some input
+          elements will be forgotten.
+      predict_drop_len: Number of input elements to drop once the fast
+          inference input cache fills up.
+      use_python_loop: Set to True to use a Python loop when iterating over
+          sub-batches of examples/heads (as opposed to a JAX/XLA loop).
+          This option will increase compilation time and jitted code size,
+          potentially drastically. Using it is not recommended except for
+          testing/debugging. In particular, note that enabling this option on
+          TPU can decrease the maximum model size that will fit in memory.
+      use_reference_code: Set to True to fall back to the reference
+          implementation of batched attention. This option will increase
+          compilation time and jitted code size, potentially drastically. Using
+          it is not recommended except for testing/debugging.
+    """
+    super().__init__(n_in=n_in, n_out=1)
+    self.n_heads = n_heads
+    self.incremental = incremental
+    if self.incremental:
+      if predict_mem_len is None or predict_drop_len is None:
+        raise ValueError('This configuration does not support fast inference.')
+      if not 0 < predict_drop_len <= predict_mem_len:
+        raise ValueError(
+            'Bad parameter values: (predict_mem_len, predict_drop_len) = ',
+            predict_mem_len, predict_drop_len)
+      self.predict_mem_len = predict_mem_len
+      self.predict_drop_len = predict_drop_len
+
+    if n_parallel_heads:
+      if ((n_parallel_heads > n_heads and n_parallel_heads % n_heads != 0)
+          or (n_parallel_heads < n_heads and n_heads % n_parallel_heads != 0)):
+        raise ValueError(
+            'n_parallel_heads must be a multiple or fraction of n_heads')
+      self.n_parallel_heads = n_parallel_heads
     else:
-      self.dropout = None
-    self._share_qk = share_qk
-    self._hard_k = hard_k
+      self.n_parallel_heads = None
+    self.use_python_loop = use_python_loop
+    self.use_reference_code = use_reference_code
 
-  def forward_with_state(self, inputs, weights=base.EMPTY_WEIGHTS,
-                         state=base.EMPTY_STATE, **kwargs):
-    del weights
-    output, _ = self.forward_and_backward(inputs, None, **kwargs)
-    return output, state
+  def init_weights_and_state(self, input_signature):
+    if not isinstance(input_signature, (tuple, list)):
+      input_signature = (input_signature,)
+    input_signature_unbatched = fastmath.nested_map(
+        lambda x: type(x)(shape=x.shape[1:], dtype=x.dtype),
+        input_signature)
+    batch_size = int(input_signature[0].shape[0])
 
-  def has_backward(self):
-    return True
+    weights = []
+    weight_rngs = fastmath.random.split(self.rng, self.n_heads)
+    for i in range(self.n_heads):
+      weights.append(self.create_weights_unbatched(input_signature_unbatched,
+                                                   weight_rngs[i]))
+    state = []
+    state_rngs = fastmath.random.split(self.rng, self.n_heads * batch_size)
+    for i in range(self.n_heads * batch_size):
+      state.append(self.create_state_unbatched(input_signature_unbatched,
+                                               state_rngs[i]))
 
-  def backward(self, inputs, output, ct, weights=base.EMPTY_WEIGHTS,
-               state=base.EMPTY_STATE, **kwargs):
-    del output, weights, state
-    _, inputs_ct = self.forward_and_backward(inputs, ct, **kwargs)
-    return inputs_ct, ()
+    stack_along_axis_0 = lambda *x: np.stack(x, axis=0)
+    weights = fastmath.nested_map_multiarg(stack_along_axis_0, *weights)
+    state = fastmath.nested_map_multiarg(stack_along_axis_0, *state)
 
-  def make_unit_length(self, x, epsilon=1e-6):
-    variance = np.mean(x**2, axis=-1, keepdims=True)
-    norm_inputs = x / np.sqrt(variance + epsilon)
-    return norm_inputs
+    if self.incremental:
+      mem = fastmath.nested_map(
+          lambda x: np.zeros(  # pylint: disable=g-long-lambda
+              x.shape[:1] + (self.predict_mem_len,) + x.shape[2:],
+              dtype=x.dtype),
+          input_signature)
+      mem_end = np.zeros((), dtype=np.int32)
+      state = (mem_end, mem, state)
 
-  def forward_and_backward(self, inputs, ct, state=base.EMPTY_STATE,
-                           new_state=base.EMPTY_STATE, rng=None, **kwargs):
-    del state, new_state, kwargs
-    query, key, value = inputs
-    depth = np.shape(query)[-1]
-    do_backprop = ct is not None
-    # jax uses the term cotangent (ct) to refer to gradient signals, and
-    # vector-Jacobian product (vjp) for back-propagation through a layer.
+    self.state = state
+    self.weights = weights
 
-    def make_mask(N, M, k):  # pylint: disable=invalid-name
-      """Constructs a slice of the causal attention mask.
+  def create_weights_unbatched(self, input_signature, rng):
+    raise NotImplementedError(
+        'Subclasses should override create_weights_unbatched')
 
-      Args:
-        N: number of query positions
-        M: number of key positions
-        k: position of the initial query element
+  def create_state_unbatched(self, input_signature, rng):
+    return ()
 
-      Returns:
-        N x M mask, where 1.0 indicates that attention is not allowed.
-      """
-      x = jax.lax.tie_in(k, np.arange(N, dtype=np.int32))
-      y = jax.lax.tie_in(k, np.arange(M, dtype=np.int32))
-      mask = jax.lax.lt(
-          (jax.lax.broadcast_in_dim(
-              x, shape=(N, M), broadcast_dimensions=(0,)) + k),
-          jax.lax.broadcast(y, [N]))
-      mask = jax.lax.convert_element_type(mask, np.float32)
-      return mask
+  def forward_unbatched(self, *inputs, weights, state):
+    """Perform attention for a single batch element and head.
 
-    def make_self_mask(N, M, k):  # pylint: disable=invalid-name
-      """Masks out elements attending to self.
+    Subclasses should override this method.
 
-      Args:
-        N: number of query positions
-        M: number of key positions
-        k: position of the initial query element
+    Args:
+      *inputs: Inputs for a single example (subclasses may use different inputs)
+      weights: Weights for a single attention head
+      state: State for a single example & attention head pair.
 
-      Returns:
-        N x M mask, where 1.0 indicates that attention is not allowed.
-      """
-      x = jax.lax.tie_in(k, np.arange(N, dtype=np.int32))
-      y = jax.lax.tie_in(k, np.arange(M, dtype=np.int32))
-      mask = jax.lax.eq(
-          (jax.lax.broadcast_in_dim(
-              x, shape=(N, M), broadcast_dimensions=(0,)) + k),
-          jax.lax.broadcast(y, [N]))
-      mask = jax.lax.convert_element_type(mask, np.float32)
-      return mask
+    Returns:
+      A tuple (output, new_state) -- output and new state for a single example
+      and attention head.
+    """
+    raise NotImplementedError('Subclasses should override forward_unbatched')
 
-    def forward_slice(query_slice, q_loop_idx, key, value):  # pylint: disable=invalid-name
-      """Forward pass for a subset of the query vectors."""
-      if self._share_qk:
-        key = self.make_unit_length(key)
+  def incremental_forward_unbatched(self, *inputs, q_start, q_len,
+                                    weights, state):
+    """Perform fast inference for a single batch element and head.
 
-      dots = np.matmul(
-          query_slice, np.swapaxes(key, -1, -2)) / np.sqrt(depth)
+    Subclasses should override this method.
 
-      # Causal masking
-      mask = make_mask(dots.shape[-2], dots.shape[-1], q_loop_idx)
-      dots = dots - 1e9 * mask
+    Args:
+      *inputs: Inputs for a single example (subclasses may use different inputs)
+      q_start: Index along the sequence-length dimension that points to the
+        first input element that should be used as a query (and not just a key).
+      q_len: Number of new query elements in this call to the attention
+        mechanism. This is typically 1 for autoregressive decoding, but may be
+        longer if initializing a language model with a prefix.
+      weights: Weights for a single attention head
+      state: State for a single example & attention head pair.
 
-      # Mask out attention to self except when no other targets are available.
-      if self._share_qk:
-        self_mask = make_self_mask(dots.shape[-2], dots.shape[-1], q_loop_idx)
-        dots = dots - 1e5 * self_mask
+    Returns:
+      A tuple (output, new_state) -- output and new state for a single example
+      and attention head.
+    """
+    raise NotImplementedError(
+        'Fast inference is not implemented for this attention type.')
 
-      # Softmax.
-      dots = np.exp(dots - math.logsumexp(dots, axis=-1, keepdims=True))
+  def forward(self, inputs):
+    """Computes this layer's output as part of a forward pass through the model.
 
-      if self.dropout is not None and self.dropout > 0.0:
-        # Dropout is broadcast across the batch+head dimension
-        dropout_shape = (1, dots.shape[-2], dots.shape[-1])
-        slice_rng = jax.random.fold_in(rng, q_loop_idx)
-        keep_prob = jax.lax.tie_in(dots, 1.0 - self.dropout)
-        keep = math.random.bernoulli(slice_rng, keep_prob, dropout_shape)
-        multiplier = keep.astype(dots.dtype) / jax.lax.tie_in(keep, keep_prob)
-        dots = dots * multiplier
+    Args:
+      inputs: Layer inputs (subclasses may use different inputs)
 
-      if self._hard_k > 0:
-        top_k = np.sort(dots)[..., -self._hard_k]  # Get the top-kth weight.
-        top_k = jax.lax.stop_gradient(top_k)
-        dots -= top_k[..., np.newaxis]  # Subtract (be 0 for lower ones).
-        dots = np.maximum(dots, 0)
-        dots_sum = np.sum(dots, axis=-1, keepdims=True)  # Re-normalize.
-        dots /= dots_sum  # Re-normalize.
+    Returns:
+      A tuple (output, new_state).
+    """
+    weights, state, rng = self.weights, self.state, self.rng
+    if not self.use_reference_code:
+      # By default, an efficient, batched implementation is used.
+      output, new_state, _, _ = self.forward_and_or_backward(
+          inputs, weights, state, rng, compute_output=True, update_state=True)
+      self.state = new_state
+      return output
 
-      out_slice = np.matmul(dots, value)
-      return out_slice
+    # The reference implementation below provides a more readable overview of
+    # what this class does. It's not optimized, however, and should only be used
+    # when testing this class for correctness.
+    if not isinstance(inputs, (tuple, list)):
+      inputs = (inputs,)
+    batch_size = int(inputs[0].shape[0])
+    seqlen = inputs[0].shape[-2]
+    d_model = inputs[0].shape[-1]
 
-    def forward_and_vjp_slice(query_slice, q_loop_idx, key, value, ct_slice):  # pylint: disable=invalid-name
-      # Capture q_loop_idx to avoid calculated gradients wrt. it.
-      def forward_slice_with_q_loop_idx(query_slice, key, value):  # pylint: disable=invalid-name
-        return forward_slice(query_slice, q_loop_idx, key, value)
+    if self.incremental:
+      inputs, state, q_start, new_mem, new_mem_end = self.use_predict_mem(
+          inputs, state)
 
-      output_slice, vjpfun = jax.vjp(
-          forward_slice_with_q_loop_idx, query_slice, key, value)
-      return output_slice, vjpfun(ct_slice)
+    output_accum = [np.zeros((seqlen, d_model)) for _ in range(batch_size)]
+    new_state = []
+    for example_idx in range(batch_size):
+      for head_idx in range(self.n_heads):
+        # pylint: disable=cell-var-from-loop
+        single_inputs = fastmath.nested_map(lambda x: x[example_idx], inputs)
+        single_weights = fastmath.nested_map(lambda w: w[head_idx], weights)
+        single_state = fastmath.nested_map(
+            lambda s: s[example_idx * self.n_heads + head_idx], state)
+        # pylint: enable=cell-var-from-loop
+        if self.incremental:
+          single_out, single_new_state = self.incremental_forward_unbatched(
+              *single_inputs, q_start=q_start, q_len=seqlen,
+              weights=single_weights, rng=rng,
+              state=single_state, update_state=True)
+        else:
+          single_out, single_new_state = self.forward_unbatched(
+              *single_inputs, weights=single_weights, rng=rng,
+              state=single_state, update_state=True)
+        new_state.append(single_new_state)
+        output_accum[example_idx] = output_accum[example_idx] + single_out
 
-    q_loop_idx = np.zeros((), dtype=np.int32)
-    q_loop_max = query.shape[-2]
-    q_loop_stride = self._loop_stride
-    if q_loop_max == 1:  # For abstract runs with unknown shapes.
-      q_loop_stride = 1
-    assert q_loop_max % q_loop_stride == 0, (
-        'Stride must evenly divide the number of query elements.')
-
-    out_accum = np.zeros_like(query)
-    if do_backprop:
-      query_ct_accum = np.zeros_like(query)
-      key_ct_accum = np.zeros_like(key)
-      value_ct_accum = np.zeros_like(value)
-      init_vals = (
-          q_loop_idx, out_accum,
-          query_ct_accum, key_ct_accum, value_ct_accum)
+    output = np.stack(output_accum, 0)
+    if new_state and fastmath.tree_leaves(new_state[0]):
+      new_state = fastmath.nested_map_multiarg(
+          lambda *s: np.stack(s, 0), *new_state)
     else:
-      init_vals = (q_loop_idx, out_accum)
+      new_state = state
+    if self.incremental:
+      new_state = (new_mem_end, new_mem, new_state)
+    self.state = new_state
+    return output
 
-    def cond_fun(vals):  # pylint: disable=invalid-name
-      q_loop_idx = vals[0]
-      return jax.lax.lt(q_loop_idx, q_loop_max)
+  def use_predict_mem(self, inputs, state):
+    """Update input cache for fast inference."""
+    mem_end, mem, state = state
+    seqlen = inputs[0].shape[-2]
 
-    def body_fun(vals):  # pylint: disable=invalid-name
-      """Compute a slice of the attention mechanism."""
-      if do_backprop:
-        (q_loop_idx, out_accum,
-         query_ct_accum, key_ct_accum, value_ct_accum) = vals
-      else:
-        q_loop_idx, out_accum = vals
+    if seqlen <= self.predict_drop_len and seqlen < self.predict_mem_len:
+      # This branch is called when only a small number of tokens are appended to
+      # the sequence, e.g. when generating one token at a time. A fixed number
+      # of tokens (self.predict_drop_tokens) will be dropped from memory if
+      # needed, and then new values will be inserted into the memory.
+      def roll_mem(buf):
+        return np.concatenate(
+            [buf[:, self.predict_drop_len:],
+             np.zeros_like(buf[:, :self.predict_drop_len])], axis=1)
 
-      query_slice = jax.lax.dynamic_slice_in_dim(
-          query, q_loop_idx, q_loop_stride, axis=-2)
-
-      if do_backprop:
-        ct_slice = jax.lax.dynamic_slice_in_dim(
-            ct, q_loop_idx, q_loop_stride, axis=-2)
-        out_slice, partial_ct = forward_and_vjp_slice(
-            query_slice, q_loop_idx, key, value, ct_slice)
-        query_ct_accum = jax.lax.dynamic_update_slice_in_dim(
-            query_ct_accum, partial_ct[0], q_loop_idx, axis=-2)
-        key_ct_accum = key_ct_accum + partial_ct[1]
-        value_ct_accum = value_ct_accum + partial_ct[2]
-      else:
-        out_slice = forward_slice(query_slice, q_loop_idx, key, value)
-
-      out_accum = jax.lax.dynamic_update_slice_in_dim(
-          out_accum, out_slice, q_loop_idx, axis=-2)
-      q_loop_idx = q_loop_idx + q_loop_stride
-
-      if do_backprop:
-        return (q_loop_idx, out_accum,
-                query_ct_accum, key_ct_accum, value_ct_accum)
-      else:
-        return (q_loop_idx, out_accum)
-
-    final_vals = jax.lax.while_loop(cond_fun, body_fun, init_vals)
-
-    if not do_backprop:
-      return final_vals[1], None
-    else:
-      return final_vals[1], final_vals[2:]
-
-
-class TimeBinCausalAttention(attention.BaseCausalAttention):
-  """Causal attention where only nearby chunks of items attend to each other."""
-
-  def __init__(self, mode, dropout=0.0, bin_length=None, n_bins=None,
-               share_qk=False):
-    super(TimeBinCausalAttention, self).__init__()
-    if (bin_length is None) == (n_bins is None):
-      raise ValueError('Exactly one of {bin_length, n_bins} must be set.')
-    self.bin_length = bin_length
-    self.n_bins = n_bins
-    self._share_qk = share_qk
-    if dropout >= 1.0:
-      raise ValueError('Dropout rates must be lower than 1.')
-    if mode == 'train':
-      self.dropout = dropout
-    else:
-      self.dropout = 0.0
-    self._mode = mode
-
-  def forward_and_backward(self, inputs, ct, state, new_state, **kwargs):
-    assert math.backend_name() == 'jax', (
-        'JAX backend is required to use forward_and_backward.')
-    # Simultaneous forward pass and backprop through the attention mechanism.
-    def _do_forward(x):  # pylint: disable=invalid-name
-      res, _ = self.forward_with_state(x, state=state, **kwargs)
-      return res
-    output, vjpfun = jax.vjp(_do_forward, inputs)
-    return output, vjpfun(ct)[0]
-
-  def make_unit_length(self, x, epsilon=1e-6):
-    variance = np.mean(x**2, axis=-1, keepdims=True)
-    norm_inputs = x / np.sqrt(variance + epsilon)
-    return norm_inputs
-
-  def _pad_inputs(self, inputs):
-    seq_len = inputs[0].shape[-2]
-    n_bins = self.n_bins
-    bin_length = self.bin_length
-    if n_bins is None:
-      n_bins = int(python_math.ceil(seq_len / bin_length))
-    else:
-      bin_length = int(python_math.ceil(seq_len / n_bins))
-    pad_len = n_bins * bin_length - seq_len
-
-    def pad_input(x):
-      pad_widths = [(0, 0)] * len(x.shape)
-      pad_widths[-2] = (0, pad_len)  # Padding on axis=-2
-      return np.pad(x, pad_widths, mode='constant',
-                    constant_values=x.dtype.type(0))
-
-    padded_inputs = tuple(map(pad_input, inputs))
-    return (padded_inputs, seq_len, n_bins)
-
-  def forward_with_state(self, inputs, weights=base.EMPTY_WEIGHTS,
-                         state=base.EMPTY_STATE, rng=None, **kwargs):
-    del weights, kwargs
-    if self._mode in ('train', 'eval'):
-      output = self._forward_train_eval(inputs, rng)
-      return (output, state)
-    else:
-      assert self._mode == 'predict'
-      return self._forward_predict(inputs, state, rng)
-
-  def _forward_train_eval(self, inputs, rng):
-    (inputs, original_len, n_bins) = self._pad_inputs(inputs)
-    q, k, v = inputs
-    seqlen = q.shape[-2]
-    # q/k/v are n_batch*n_heads, seqlen, d_head
-    # Time indices for causal masking.
-    t = jax.lax.tie_in(q, np.arange(seqlen))
-
-    # Split off a "bin" axis for chunks of consecutive items.
-    bq_t = np.reshape(t, (n_bins, -1))
-    bq = np.reshape(q, (q.shape[0], n_bins, -1, q.shape[-1]))
-    if self._share_qk:
-      bk = self.make_unit_length(bq)
-    else:
-      bk = np.reshape(k, (k.shape[0], n_bins, -1, k.shape[-1]))
-    bv = np.reshape(v, (v.shape[0], n_bins, -1, v.shape[-1]))
-
-    # Allow each chunk to attend within itself, and also one chunk back.
-    def look_one_back(x):
-      # Output: pairs [ bin_i bin_{i-1} ] concatenated on the time axis.
-      if len(x.shape) == 2:
-        x_extra = np.concatenate([x[-1:, :], x[:-1, :]], axis=0)
-        return np.concatenate([x, x_extra], axis=1)
-      else:
-        assert len(x.shape) == 4
-        x_extra = np.concatenate([x[:, -1:, :, :], x[:, :-1, :, :]], axis=1)
-        return np.concatenate([x, x_extra], axis=2)
-
-    bkv_t = look_one_back(bq_t)
-    bk = look_one_back(bk)
-    bv = look_one_back(bv)
-
-    # Dot-product attention.
-    dots = np.matmul(bq, np.swapaxes(bk, -1, -2)) / np.sqrt(bq.shape[-1])
-
-    # Causal masking based on the time indices.
-    mask = jax.lax.convert_element_type(
-        jax.lax.lt(bq_t[None, :, :, None], bkv_t[None, :, None, :]),
-        np.float32)
-    dots = dots - 1e9 * mask
-
-    # Mask out attention to self except when no other targets are available.
-    if self._share_qk:
-      self_mask = np.eye(dots.shape[2], dots.shape[3])
-      self_mask = self_mask[np.newaxis, np.newaxis, :, :]
-      self_mask = jax.lax.tie_in(dots, self_mask)
-      dots = dots - 1e5 * self_mask
-
-    # Softmax.
-    dots = np.exp(dots - math.logsumexp(dots, axis=-1, keepdims=True))
-
-    if self.dropout > 0.0:
-      # Dropout is broadcast across the batch+head dimension
-      dropout_shape = (1, dots.shape[-3], dots.shape[-2], dots.shape[-1])
-      keep_prob = jax.lax.tie_in(dots, 1.0 - self.dropout)
-      keep = math.random.bernoulli(rng, keep_prob, dropout_shape)
-      multiplier = keep.astype(dots.dtype) / jax.lax.tie_in(keep, keep_prob)
-      dots = dots * multiplier
-
-    bo = np.matmul(dots, bv)
-
-    output = np.reshape(bo, (bo.shape[0], -1, bo.shape[-1]))
-    assert output.shape == v.shape
-    return output[..., :original_len, :]
-
-  def _forward_predict(self, inputs, state, rng):
-    if not self._share_qk:
-      state = _fast_inference_update_state(inputs, state)
-      (q, _, _) = inputs
-      (ks, vs, mask, seq_indices) = state
-    else:
-      mask_excluding_attention_in_place = state[2]
-      (q, _, v) = inputs
-      k = self.make_unit_length(q)
-      state = _fast_inference_update_state((q, k, v), state)
-      (ks, vs, mask, seq_indices) = state
-      # Only the initial position in a sequence may attend to itself.
-      where = (seq_indices > 1)[None, None]
-      mask = np.where(where, mask_excluding_attention_in_place, mask)
-
-    output = attention.DotProductAttention(
-        q, ks, vs, mask, dropout=self.dropout, mode=self._mode, rng=rng
-    )
-
-    def roll_single_seq(state):
-      """Rolls the buffers backward to make space for new data.
-
-      Works for just one sequence in a batch.
-
-      Args:
-        state: Tuple (keys, values, mask, index).
-
-      Returns:
-        New state for a single sequence.
-      """
-      (ks, vs, mask, index) = state
-      # Move the second bin into the first one's place in both buffers.
-      def roll_buffer(buf):
-        return jax.ops.index_update(
-            buf,
-            jax.ops.index[:self.bin_length, :],
-            buf[self.bin_length:, :],
-        )
-      (ks, vs) = map(roll_buffer, (ks, vs))
-      # Zero out the second bin in the mask.
-      mask = jax.ops.index_update(
-          mask, jax.ops.index[:, self.bin_length:], 0
+      do_roll_mem = (mem_end + seqlen > self.predict_mem_len)
+      mem = jax.lax.cond(
+          pred=do_roll_mem,
+          true_operand=mem,
+          true_fun=lambda x: fastmath.nested_map(roll_mem, x),
+          false_operand=mem,
+          false_fun=lambda x: x,
       )
-      # Update the index to match the rolled buffers.
-      index -= self.bin_length
-      return (ks, vs, mask, index)
-
-    @jax.vmap
-    def maybe_roll_state(state):
-      """Rolls the buffers if they reach the end.
-
-      Vectorized to handle batches of sequences.
-
-      Args:
-        state: Tuple (keys, values, mask, index).
-
-      Returns:
-        New state for a batch of sequences.
-      """
-      (_, _, _, index) = state
-      # Once we get to the end of the buffer, move the second bin back to make
-      # space for new data: [ bin_i bin_{i+1} | ] -> [ bin_{i+1} | bin_{i+1} ],
-      # where | is where index points at in the buffer.
-      return jax.lax.cond(
-          pred=(index == 2 * self.bin_length),
-          true_operand=state,
-          true_fun=roll_single_seq,
-          false_operand=state,
-          false_fun=(lambda x: x),
-      )
-    state = maybe_roll_state(state)
-    return (output, state)
-
-  def new_weights_and_state(self, input_signature):
-    if self._mode in ('train', 'eval'):
-      return base.EMPTY_WEIGHTS, base.EMPTY_STATE
-
-    assert self._mode == 'predict'
-    assert self.bin_length is not None, (
-        'For fast inference, TimeBinCausalAttention must be parameterized by '
-        'bin_length.'
-    )
-    weights = base.EMPTY_WEIGHTS
-    state = _fast_inference_init_state(
-        input_signature, 2 * self.bin_length
-    )
-    return weights, state
-
-
-class LSHCausalAttention(attention.BaseCausalAttention):
-  """Causal attention based on locality-sensitive hashing."""
-
-  def __init__(self,
-               dropout,
-               mode,
-               n_bins=64,
-               n_hashes=1,
-               n_buckets=64,
-               one_rng=False,
-               allow_duplicate_attention=False,
-               attend_across_buckets=False,
-               hard_k=0,
-               factorize_hash=False,
-               rehash_each_round=True,
-               drop_for_hash_rate=0.0,
-               data_rotation=False,
-               data_rotation_farthest=False,
-               data_rotation_farthest_num=8,
-               max_len_for_inference=16384,
-               bucket_capacity_for_inference=256):
-    # TODO(kitaev): use shared bucket length config that's shared for train+eval
-    super(LSHCausalAttention, self).__init__(mode=mode)
-    self._mode = mode
-    if dropout >= 1.0:
-      raise ValueError('Dropout rates must be lower than 1.')
-    if mode == 'train':
-      self._dropout = dropout
+      mem_end = np.where(do_roll_mem, mem_end - self.predict_drop_len, mem_end)
+      def update_mem(mem_element, new_vals):
+        assert new_vals.shape[1] == seqlen
+        if seqlen == 1:
+          return jax.ops.index_update(
+              mem_element, jax.ops.index[:, mem_end], new_vals[:, 0, ...])
+        else:
+          return jax.lax.dynamic_update_slice_in_dim(
+              mem_element, new_vals, mem_end, axis=1)
+      inputs = fastmath.nested_map_multiarg(update_mem, mem, inputs)
+      return inputs, state, mem_end, inputs, mem_end + seqlen
     else:
-      self._dropout = 0.0
+      assert seqlen > self.predict_drop_len or seqlen == self.predict_mem_len
+      # This branch handles the case where a large number of tokens are being
+      # introduced all at once. The code here assumes that we are at the start
+      # of the sequence, which matches the typical use case of decoding from a
+      # language model given a long prefix. Note that if we're not at the start
+      # of the sequence, the code here won't work.
+      new_flat_mem = []
+      for inp in fastmath.tree_leaves(inputs):
+        assert inp.shape[1] == seqlen
+        if seqlen == self.predict_mem_len:
+          new_mem_val = inp
+        elif seqlen > self.predict_mem_len:
+          new_mem_val = inp[:, -self.predict_mem_len:]  # pylint: disable=invalid-unary-operand-type
+        else:
+          new_mem_val = np.concatenate([
+              inp,
+              np.zeros(inp.shape[:1]
+                       + (self.predict_mem_len - inp.shape[1],)
+                       + inp.shape[2:],
+                       dtype=inp.dtype)
+          ], axis=1)
+        new_flat_mem.append(new_mem_val)
+      mem = jax.tree_unflatten(jax.tree_structure(mem), new_flat_mem)
 
-    assert n_buckets >= n_bins, 'This setting is not recommended: too few bins.'
-    assert rehash_each_round or allow_duplicate_attention, (
-        'The setting {allow_duplicate_attention=False, rehash_each_round=False}'
-        ' is not implemented.')
-    self.n_bins = n_bins
-    self.n_hashes = n_hashes
-    self.n_buckets = n_buckets
-    self._drop_for_hash_rate = drop_for_hash_rate
-    self._one_rng = one_rng
-    self._factorize_hash = factorize_hash
-    self._prng = None
-    if one_rng:
-      seed = random.randint(0, 2**31 - 1)
-      self._prng = math.random.get_prng(seed)
-
-    self._allow_duplicate_attention = allow_duplicate_attention
-    self._attend_across_buckets = attend_across_buckets
-    self._hard_k = hard_k
-    self._rehash_each_round = rehash_each_round
-    # If True, the rotation matrices for hashing are derived from data, instead
-    # of being completely random.
-    self._data_rotation = data_rotation
-    self._data_rotation_farthest = data_rotation_farthest
-    self._data_rotation_farthest_num = data_rotation_farthest_num
-
-    self._max_len_for_inference = max_len_for_inference
-    self._bucket_capacity_for_inference = bucket_capacity_for_inference
-
-  def forward_with_state(self, inputs, weights=base.EMPTY_WEIGHTS,
-                         state=base.EMPTY_STATE, rng=None, **kwargs):
-    del weights, kwargs
-    if self._mode == 'predict':
-      output, state = self.batch_predict(inputs[0], inputs[2], state, rng=rng)
-    else:
-      output, state, _ = self.batch_call_and_or_grad(
-          inputs[0], inputs[2], new_state=None, return_state=True, rng=rng)
-    return output, state
-
-  def forward_and_backward(self, inputs, ct, state=base.EMPTY_STATE,
-                           new_state=base.EMPTY_STATE, rng=None, **kwargs):
-    del kwargs
-    assert self._mode != 'predict'
-    output, _, (qk_ct, v_ct) = self.batch_call_and_or_grad(
-        inputs[0], inputs[2], ct=ct, new_state=new_state, rng=rng)
-    return output, (qk_ct, np.zeros_like(inputs[1]), v_ct)
+      # This code only works at the start of the sequence. There's no "assert"
+      # primitive we can use to signal an error, so we instead signal the error
+      # by introducing NaNs into the computation.
+      def replace_with_nan_if_not_seq_start(x):
+        if x.dtype != np.float32:
+          return x
+        return jax.lax.cond(
+            pred=jax.lax.eq(mem_end, 0), true_operand=x, true_fun=lambda x: x,
+            false_operand=x, false_fun=lambda x: x * np.nan)
+      inputs = fastmath.nested_map(replace_with_nan_if_not_seq_start, inputs)
+      return inputs, state, 0, mem, np.minimum(seqlen, self.predict_mem_len)
 
   @property
   def has_backward(self):
-    return True
+    # Use an efficient backward pass, unless we're running the reference code.
+    return not self.use_reference_code
 
-  def backward(self, inputs, output, ct, weights=base.EMPTY_WEIGHTS,
-               state=base.EMPTY_STATE, new_state=base.EMPTY_STATE, rng=None,
+  def backward(self, inputs, output, grad, weights, state, new_state, rng=None,
                **kwargs):
-    del output, weights, state
-    assert self._mode != 'predict'
-    _, _, (qk_ct, v_ct) = self.batch_call_and_or_grad(
-        inputs[0], inputs[2], return_output=False,
-        ct=ct, new_state=new_state, rng=rng)
-    inputs_ct = (qk_ct, np.zeros_like(inputs[1]), v_ct)
-    return inputs_ct, ()
+    """Custom backward pass, for efficiency (see forward_and_or_backward)."""
+    assert not self.use_reference_code
+    del output, state, kwargs
+    _, _, inputs_grad, weights_grad = self.forward_and_or_backward(
+        inputs, weights, new_state, rng, output_grad=grad,
+        compute_output=False, update_state=False)
+    return inputs_grad, weights_grad
 
-  def new_weights_and_state(self, input_signature):
-    qk = input_signature[0]
-    if self._mode != 'predict':
-      state = np.zeros(
-          (qk.shape[0], self.n_hashes * qk.shape[1]), dtype=np.int32)
+  def forward_and_or_backward(
+      self, inputs, weights, state, rng, output_grad=None,
+      compute_output=True, update_state=True):
+    """Performs batched forward and/or backward passes.
+
+    See `forward` for a reference implementation of what this layer does. The
+    reference implementation is not very efficient, however, and this method
+    provides a more performant version.
+
+    Args:
+      inputs: inputs to the attention layer
+      weights: weights for the attention layer
+      state: state of the attention layer
+      rng: PRNG key for the layer (shared across all examples and heads)
+      output_grad: gradient of the loss wrt the output of the layer, or None.
+          This function performs the backward pass iff `output_grad` is not
+          None.
+      compute_output: bool: whether to return the output of the forward pass
+          (for example, a pure backwards pass does not need to return the
+          output).
+      update_state: bool: whether to return an updated layer state.
+
+    Returns:
+      A tuple (output, new_state, inputs_grad, weights_grad).
+
+      - output is not None iff compute_output is True
+      - new_state is not None iff update_state is True
+      - inputs_grad & weights_grad are not None iff output_grad is not None
+    """
+    # TODO(kitaev): profile ~4% speed drop compared to previous implementation
+    #     in some conditions. Other conditions (e.g. the enwik8 model) appear
+    #     to have the same overall training speed.
+    # TODO(b/148460708): reduce memory usage further
+    # TODO(kitaev): there should be a higher-level API (like vmap) that does
+    #     batching, instead of needing 3 separate manual implementations here.
+
+    # Notes regarding the implementation:
+    # (a) Multiple heads or examples are batched together. There are three
+    #     different regimes possible: one head at a time (for long sequences and
+    #     expensive attention types), several attention heads at a time (for
+    #     long sequences but less-expensive attention types), and several
+    #     examples at a time (for large batches of shorter sequences). For the
+    #     time being, each of these regimes has its own code.
+    # (b) Python loops produce large computation graphs when jitted, so the
+    #     default is to use a JAX loop instead.
+    # (c) No intermediate quantities are cached for the backward pass. Instead,
+    #     the forward pass is re-computed when doing backprop. This approach is
+    #     often called "checkpointing" or "rematerialization". When not all
+    #     examples or heads fit in memory simultaneously, the implementation
+    #     should be [FW-BW-1] and NOT [FW-BW-2], because the latter has worse
+    #     memory locality. I don't think JAX autodiff can synthesize [FW-BW-1]
+    #     automatically, so the looping for the backward pass is done manually.
+    #
+    #     [FW-BW-1] for example, head in zip(examples, heads):
+    #                 forward(example, head)
+    #                 backward(example, head)  # uses intermediates from forward
+    #
+    #     [FW-BW-2] for example, head in zip(examples, heads):
+    #                 forward(example, head)
+    #               for example, head in zip(examples, heads):
+    #                 backward(example, head)
+
+    have_single_input = not isinstance(inputs, (tuple, list))
+    if have_single_input:
+      inputs = (inputs,)
+    batch_size = int(inputs[0].shape[0])
+    seqlen = inputs[0].shape[-2]
+    d_model = inputs[0].shape[-1]
+
+    compute_grad = (output_grad is not None)
+    assert compute_output or compute_grad, 'No work to perform!'
+
+    if not self.incremental:
+      forward_unbatched = functools.partial(
+          self.forward_unbatched, rng=rng, update_state=update_state)
     else:
-      # Having separate key/value caches for each hashing round would use a
-      # lot of memory, so instead each hashing round stores indices into a
-      # single key/value cache. Even with this approach, the maximum sequence
-      # length that fits in memory is shorter for fast inference than training.
-      # Fast inference is "fast" in that it avoids recomputation, which is the
-      # exact opposite tradeoff of memory-saving tricks like reversibility.
-      # There is still some potential room for memory savings by caching
-      # activations rather than key-value pairs (currently not implemented
-      # because it would require changes outside of this class).
-      batch_size = input_signature[0].shape[0]
-      max_len = self._max_len_for_inference
-      bucket_capacity = self._bucket_capacity_for_inference
-      d_qk = input_signature[0].shape[-1]
-      d_v = input_signature[2].shape[-1]
-      dtype = input_signature[0].dtype
-
-      ks = np.zeros((batch_size, max_len, d_qk), dtype=dtype)
-      vs = np.zeros((batch_size, max_len, d_v), dtype=dtype)
-      mask = np.full((batch_size, max_len), -1e9, dtype=dtype)
-      index = 0
-      bucket_assignments = np.full(
-          (batch_size * self.n_hashes * self.n_buckets, bucket_capacity),
-          max_len, dtype=np.int32)
-      assignment_locs = np.zeros(
-          batch_size * self.n_hashes * self.n_buckets, dtype=np.int32)
-      hash_rng = self.new_rng()
-
-      state = (
-          ks, vs, mask, index, bucket_assignments, assignment_locs, hash_rng)
-
-    return self.new_weights(input_signature), state
-
-  def batch_call_and_or_grad(self, qk, v, ct=None, return_output=True,
-                             new_state=None, return_state=False,
-                             rng=None):
-    assert return_output or ct is not None, 'No work to perform!'
-    if new_state is not None and new_state is not base.EMPTY_STATE:
-      buckets = new_state
-    else:
-      buckets = None
-
-    # The approach here is to perform attention for one batch element and head
-    # at a time. Note that there is absolutely no interaction across examples or
-    # heads: this layer has no parameters, and hashing patterns are also
-    # different across examples/heads. As a result, batching doesn't give any
-    # performance gains except in the case of accelerator under-utilization. We
-    # assume that hash-based attention will be applied primarily to long
-    # sequences, where unbatched attention for a single head has sufficient
-    # computation to fill up the accelerator.
-
-    batch_loop_idx = np.zeros((), dtype=np.int32)
-    batch_loop_max = qk.shape[0]
-
-    init_vals = (batch_loop_idx,)
-    if return_output:
-      out_accum = np.zeros_like(qk)
-      init_vals = init_vals + (out_accum,)
-    if return_state:
-      buckets_accum = np.zeros(
-          [qk.shape[0], self.n_hashes * qk.shape[1]], dtype=np.int32)
-      init_vals = init_vals + (buckets_accum,)
-    if ct is not None:
-      qk_ct_accum = np.zeros_like(qk)
-      v_ct_accum = np.zeros_like(v)
-      init_vals = init_vals + (qk_ct_accum, v_ct_accum)
-
-    def cond_fun(vals):
-      batch_loop_idx = vals[0]
-      return jax.lax.lt(batch_loop_idx, batch_loop_max)
-
-    def body_fun(vals):
-      """Performs attention for a single batch element and head."""
-      batch_loop_idx = vals[0]
-      if self._prng is None:
-        hash_slice_rng = jax.random.fold_in(rng, batch_loop_idx)
-        hash_rng, slice_rng = math.random.split(hash_slice_rng)
+      if update_state:
+        inputs, state, q_start, new_mem, new_mem_end = self.use_predict_mem(
+            inputs, state)
       else:
-        # TODO(kitaev): Maybe use the same RNG across examples (but not heads)?
-        hash_rng = jax.random.fold_in(self._prng, batch_loop_idx)
-        slice_rng = jax.random.fold_in(rng, batch_loop_idx)
-      qk_slice = jax.lax.dynamic_index_in_dim(
-          qk, batch_loop_idx, axis=0, keepdims=False)
-      v_slice = jax.lax.dynamic_index_in_dim(
-          v, batch_loop_idx, axis=0, keepdims=False)
+        # This assumes that the memory stores all of the inputs, which would not
+        # be valid if doing backprop in mode 'predict' with long lengths.
+        new_mem_end, inputs, state = state
+        q_start = new_mem_end - seqlen
 
-      if buckets is None:
-        buckets_slice = self.hash_vectors(qk_slice, rng=hash_rng)
+      forward_unbatched = functools.partial(
+          self.incremental_forward_unbatched,
+          q_start=fastmath.stop_gradient(q_start),
+          q_len=fastmath.stop_gradient(seqlen),
+          rng=rng, update_state=update_state)
+
+    # Adjust degree of parallelism based on the batch size.
+    n_parallel_heads = batch_size * self.n_heads
+    if self.n_parallel_heads and self.n_parallel_heads < n_parallel_heads:
+      n_parallel_heads = self.n_parallel_heads
+
+    def tree_update(tree, indices, new_values):
+      return fastmath.nested_map_multiarg(
+          lambda x, y: jax.ops.index_update(x, jax.ops.index[indices], y),
+          tree, new_values)
+
+    def tree_add(tree, indices, new_values):
+      return fastmath.nested_map_multiarg(
+          lambda x, y: jax.ops.index_add(x, jax.ops.index[indices], y),
+          tree, new_values)
+
+    if compute_grad:
+      inputs_is_differentiable = fastmath.nested_map(
+          lambda x: np.issubdtype(x.dtype, np.inexact), inputs)
+      def split_differentiable(xs):
+        differentiable_xs = fastmath.nested_map_multiarg(
+            lambda x, is_differentiable: x if is_differentiable else None,
+            xs, inputs_is_differentiable)
+        non_differentiable_xs = fastmath.nested_map_multiarg(
+            lambda x, is_differentiable: None if is_differentiable else x,
+            xs, inputs_is_differentiable)
+        return differentiable_xs, non_differentiable_xs
+      def join_differentiable(differentiable_xs, non_differentiable_xs):
+        """Reconstitute inputs pytree from differentiable/non-d. partitions."""
+        differentiable_leaves = fastmath.tree_leaves(differentiable_xs)
+        non_differentiable_leaves = fastmath.tree_leaves(non_differentiable_xs)
+        leaves = []
+        for is_differentiable in fastmath.tree_leaves(inputs_is_differentiable):
+          if is_differentiable:
+            leaves.append(differentiable_leaves.pop(0))
+          else:
+            leaves.append(non_differentiable_leaves.pop(0))
+        assert not differentiable_leaves
+        assert not non_differentiable_leaves
+        return jax.tree_unflatten(jax.tree_structure(inputs), leaves)
+
+      def vjp(fn, inp, *args, has_aux=False):
+        d_inp, nd_inp = split_differentiable(inp)
+        def fn_closed_over_nd_inp(d_inp, *args):
+          inp = join_differentiable(d_inp, nd_inp)
+          return fn(inp, *args)
+        return fastmath.vjp(fn_closed_over_nd_inp, d_inp, *args,
+                            has_aux=has_aux)
+
+    if n_parallel_heads == 1:
+      def run_inner(idx, loop_val):
+        """Runs one slice of attention (for a single head)."""
+        o_all, s_all, i_ct_all, w_ct_all = loop_val
+        example_idx = idx // self.n_heads
+        head_idx = idx % self.n_heads
+
+        i_h = fastmath.nested_map(lambda x: x[example_idx], inputs)
+        w_h = fastmath.nested_map(lambda w: w[head_idx], weights)
+        s_h = fastmath.nested_map(lambda s: s[idx], state)
+
+        def forward_fn(i_h, w_h):
+          return forward_unbatched(
+              *i_h, weights=w_h, state=fastmath.stop_gradient(s_h))
+
+        if compute_grad:
+          o_h, backward_fn, s_h = vjp(forward_fn, i_h, w_h, has_aux=True)
+          ct_h = output_grad[example_idx]
+          assert o_h.shape == ct_h.shape
+          i_ct_h, w_ct_h = backward_fn(ct_h)
+        else:
+          o_h, s_h = forward_fn(i_h, w_h)
+
+        if compute_output:
+          o_all = jax.ops.index_add(o_all, example_idx, o_h)
+        if update_state:
+          s_all = tree_update(s_all, idx, s_h)
+        if compute_grad:
+          i_ct_all = tree_add(i_ct_all, example_idx, i_ct_h)
+          w_ct_all = tree_add(w_ct_all, head_idx, w_ct_h)
+        return (o_all, s_all, i_ct_all, w_ct_all)
+    elif n_parallel_heads < self.n_heads:
+      assert self.n_heads % n_parallel_heads == 0
+      def run_inner(idx, loop_val):
+        """Runs one slice of attention (multiple heads, but one example)."""
+        o_all, s_all, i_ct_all, w_ct_all = loop_val
+        idx = idx * self.n_parallel_heads
+        example_idx = idx // self.n_heads
+        head_idx_lo = idx % self.n_heads
+        # Use iota here instead of np.arange, because np.arange will fail to
+        # infer that the slice size is a compile-time constant.
+        head_range = head_idx_lo + jax.lax.iota(np.int32, n_parallel_heads)
+        state_range = idx + jax.lax.iota(np.int32, n_parallel_heads)
+
+        i_mh = fastmath.nested_map(lambda x: x[example_idx], inputs)
+        w_mh = fastmath.nested_map(lambda w: w[head_range], weights)
+        s_mh = fastmath.nested_map(lambda s: s[state_range], state)
+        def forward_unbatched_h(i_h, w_h, s_h):
+          return forward_unbatched(*i_h, weights=w_h, state=s_h)
+        def forward_fn(i_mh, w_mh):
+          o_mh, new_s_mh = jax.vmap(
+              forward_unbatched_h, in_axes=(None, 0, 0), out_axes=0)(
+                  i_mh, w_mh, s_mh)
+          o_mh = o_mh.sum(0)
+          return o_mh, new_s_mh
+
+        if compute_grad:
+          o_mh, backward_fn, s_mh = vjp(forward_fn, i_mh, w_mh, has_aux=True)
+          ct_mh = output_grad[example_idx]
+          assert o_mh.shape == ct_mh.shape
+          i_ct_mh, w_ct_mh = backward_fn(ct_mh)
+        else:
+          o_mh, s_mh = forward_fn(i_mh, w_mh)
+
+        if compute_output:
+          o_all = jax.ops.index_add(o_all, example_idx, o_mh)
+        if update_state:
+          s_all = tree_update(s_all, state_range, s_mh)
+        if compute_grad:
+          i_ct_all = tree_add(i_ct_all, example_idx, i_ct_mh)
+          w_ct_all = tree_add(w_ct_all, head_range, w_ct_mh)
+        return (o_all, s_all, i_ct_all, w_ct_all)
+    else:
+      assert n_parallel_heads % self.n_heads == 0
+      def forward_single_example(i_x, w_all, s_x):
+        def forward_unbatched_h(i_h, w_h, s_h):
+          return forward_unbatched(*i_h, weights=w_h, state=s_h)
+        o_x, s_x = jax.vmap(
+            forward_unbatched_h, in_axes=(None, 0, 0), out_axes=(0, 0))(
+                i_x, w_all, s_x)
+        o_x = o_x.sum(0)
+        return o_x, s_x
+      def run_inner(idx, loop_val):
+        """Runs one slice of attention (all heads for one or more examples)."""
+        o_all, s_all, i_ct_all, w_ct_all = loop_val
+        idx = idx * n_parallel_heads
+        example_idx_lo = idx // self.n_heads
+        # Use iota here instead of np.arange, because np.arange will fail to
+        # infer that the slice size is a compile-time constant.
+        example_range = example_idx_lo + jax.lax.iota(
+            np.int32, n_parallel_heads // self.n_heads)
+        state_range = idx + jax.lax.iota(np.int32, n_parallel_heads)
+
+        i_mex = fastmath.nested_map(lambda x: x[example_range], inputs)
+        s_mex = fastmath.nested_map(
+            lambda s: np.reshape(s[state_range],  # pylint: disable=g-long-lambda
+                                 (-1, self.n_heads) + s.shape[1:]),
+            state)
+        def forward_fn(i_mex, w_all):
+          o_mex, new_s_mex = jax.vmap(
+              forward_single_example, in_axes=(0, None, 0), out_axes=(0, 0))(
+                  i_mex, w_all, s_mex)
+          new_s_mex = fastmath.nested_map(
+              lambda s: np.reshape(s, (n_parallel_heads,) + s.shape[2:]),
+              new_s_mex)
+          return o_mex, new_s_mex
+
+        if compute_grad:
+          o_mex, backward_fn, s_mex = vjp(forward_fn, i_mex, weights,
+                                          has_aux=True)
+          ct_mex = output_grad[example_range]
+          assert o_mex.shape == ct_mex.shape
+          i_ct_mex, w_ct_mex = backward_fn(ct_mex)
+        else:
+          o_mex, s_mex = forward_fn(i_mex, weights)
+
+        if compute_output:
+          o_all = jax.ops.index_add(o_all, jax.ops.index[example_range], o_mex)
+        if update_state:
+          s_all = tree_update(s_all, state_range, s_mex)
+        if compute_grad:
+          i_ct_all = tree_update(i_ct_all, example_range, i_ct_mex)
+          w_ct_all = fastmath.nested_map_multiarg(
+              lambda old_all, delta_all: old_all + delta_all,
+              w_ct_all, w_ct_mex)
+        return (o_all, s_all, i_ct_all, w_ct_all)
+
+    o_all = s_all = i_ct_all = w_ct_all = None
+    if compute_output:
+      o_all = np.zeros(
+          (batch_size, seqlen, d_model), dtype=inputs[0].dtype)
+    if update_state:
+      s_all = state
+    if compute_grad:
+      i_ct_all = fastmath.nested_map(np.zeros_like, inputs)
+      i_ct_all, i_nondifferentiable_dummy_ct = split_differentiable(i_ct_all)
+      w_ct_all = fastmath.nested_map(np.zeros_like, weights)
+
+    loop_val = (o_all, s_all, i_ct_all, w_ct_all)
+
+    assert (batch_size * self.n_heads) % n_parallel_heads == 0
+    loop_hi = (batch_size * self.n_heads) // n_parallel_heads
+    if self.use_python_loop or loop_hi == 1:
+      for idx in range(loop_hi):
+        loop_val = run_inner(idx, loop_val)
+    else:
+      loop_val = jax.lax.fori_loop(
+          0, loop_hi, run_inner, loop_val)
+
+    (o_all, s_all, i_ct_all, w_ct_all) = loop_val
+
+    if compute_grad:
+      i_ct_all = join_differentiable(i_ct_all, i_nondifferentiable_dummy_ct)
+
+    if self.incremental and update_state:
+      s_all = (new_mem_end, new_mem, s_all)
+
+    if have_single_input and compute_grad:
+      assert isinstance(i_ct_all, tuple) and len(i_ct_all) == 1
+      return (o_all, s_all, i_ct_all[0], w_ct_all)
+    else:
+      return (o_all, s_all, i_ct_all, w_ct_all)
+
+
+class SelfAttention(EfficientAttentionBase):
+  """Memory-efficient self-attention (second attempt)."""
+
+  def __init__(self,
+               n_heads=2, d_qk=64, d_v=64, share_qk=False,
+               causal=False, masked=False,
+               chunk_len=None, n_chunks_before=0, n_chunks_after=0,
+               bias=False,
+               mode='train',
+               predict_mem_len=None, predict_drop_len=None,
+               attention_dropout=0.0,
+               output_dropout=0.0,
+               n_parallel_heads=None,
+               use_python_loop=False,
+               use_reference_code=False,
+              ):
+    """Construct a self-attention layer.
+
+    Args:
+      n_heads: int: Number of attention heads
+      d_qk: int: Depth of query ond key vectors
+      d_v: int: Depth of value vectors
+      share_qk: bool: Set to True to share query and key projection weights
+      causal: bool: Set to True to mask out attention to future items
+      masked: bool: Set to True to accept an additional mask argument, that
+        allows masking out attention to padding tokens.
+      chunk_len (optional): Number of tokens per chunk. Setting this option will
+        enable chunked attention.
+      n_chunks_before: Number of previous chunks to attend to, when using
+        chunked attention.
+      n_chunks_after: Number of subsequent chunks to attend to, when using
+        chunked attention. Don't use this option for causal attention, because
+        attention to future tokens will be masked out anyway. However, note that
+        cross-chunk attention "wraps around" in both directions, so this option
+        is never a strict no-op.
+      bias: bool: Set to True to add bias vectors when computing query/key/value
+      mode: 'train', 'eval', or 'predict'
+      predict_mem_len: int: Number of input positions to remember in a cache
+        when doing fast inference. Whenever the cache fills up, some input
+        elements will be forgotten. When chunking is enabled, the default is to
+        store chunk_len * (1 + n_chunks_before) elements.
+      predict_drop_len: int: Number of input elements to drop once the fast
+        inference input cache fills up. When chunking is enabled, the default is
+        to drop exactly chunk_len elements.
+      attention_dropout: Dropout probability for attention mask.
+      output_dropout: Dropout probability for the layer output.
+      n_parallel_heads: see EfficientAttentionBase. This option controls the
+        trade-off between parallelism and memory usage.
+      use_python_loop: For testing/debugging (see EfficientAttentionBase)
+      use_reference_code: For testing/debugging (see EfficientAttentionBase)
+    """
+    if mode == 'predict':
+      assert causal, 'Only causal attention supports fast inference'
+      assert chunk_len is not None or (predict_mem_len and predict_drop_len)
+      predict_mem_len = predict_mem_len or (chunk_len * (1 + n_chunks_before))
+      predict_drop_len = predict_drop_len or chunk_len
+    super().__init__(
+        n_heads=n_heads,
+        n_in=(2 if masked else 1),
+        n_parallel_heads=n_parallel_heads,
+        incremental=(mode == 'predict'),
+        predict_mem_len=predict_mem_len,
+        predict_drop_len=predict_drop_len,
+        use_python_loop=use_python_loop,
+        use_reference_code=use_reference_code,
+        )
+    self.d_qk = d_qk
+    self.d_v = d_v
+    self.share_qk = share_qk
+    self.causal = causal
+    self.masked = masked
+    self.chunk_len = chunk_len
+    self.n_chunks_before = n_chunks_before
+    self.n_chunks_after = n_chunks_after
+    self.bias = bias
+    self.mode = mode
+    if mode == 'train':
+      self.attention_dropout = attention_dropout
+      self.output_dropout = output_dropout
+    else:
+      self.attention_dropout = 0.0
+      self.output_dropout = 0.0
+
+  def _kernel_initializer(self, shape, rng):
+    # Attention uses Glorot uniform initalization with respect to the *total*
+    # dimension of queries/key/values across all heads. We initialize one head
+    # at a time in this class, so init.GlorotUniformInitializer won't work.
+    # This initialization type is for parity with previous Trax & tensor2tensor
+    # Transformers; it's not clear if it's strictly needed for model accuracy.
+    lim = np.sqrt(6.0 / (shape[0] + shape[1] * self.n_heads))
+    return fastmath.random.uniform(rng, shape, np.float32, -lim, lim)
+
+  def create_weights_unbatched(self, input_signature, rng):
+    if isinstance(input_signature, (tuple, list)):
+      input_signature = input_signature[0]
+    d_model = input_signature.shape[-1]
+    rng_q, rng_k, rng_v, rng_o = fastmath.random.split(rng, 4)
+    w_q = self._kernel_initializer((d_model, self.d_qk), rng_q)
+    if not self.share_qk:
+      w_k = self._kernel_initializer((d_model, self.d_qk), rng_k)
+    w_v = self._kernel_initializer((d_model, self.d_v), rng_v)
+    w_o = np.transpose(self._kernel_initializer((d_model, self.d_v), rng_o))
+
+    if self.bias:
+      b_q = np.zeros(self.d_qk)
+      b_v = np.zeros(self.d_v)
+      if self.share_qk:
+        return (w_q, w_v, w_o, b_q, b_v)
       else:
-        buckets_slice = jax.lax.dynamic_index_in_dim(
-            buckets, batch_loop_idx, axis=0, keepdims=False)
+        b_k = np.zeros(self.d_qk)
+        return (w_q, w_k, w_v, w_o, b_q, b_k, b_v)
 
-      if ct is None:
-        out_slice = self.single_call(
-            qk_slice, v_slice, buckets_slice, rng=slice_rng)
+    if self.share_qk:
+      return (w_q, w_v, w_o)
+    else:
+      return (w_q, w_k, w_v, w_o)
+
+  def forward_unbatched(self, x, mask=None, *,
+                        weights, state, rng, update_state):
+    del update_state
+    attend_rng, output_rng = fastmath.random.split(rng)
+    if self.bias:
+      if self.share_qk:
+        w_q, w_v, w_o, b_q, b_v = weights
       else:
-        def _do_single_call(qk_slice, v_slice):
-          return self.single_call(
-              qk_slice, v_slice, buckets_slice, rng=slice_rng)
-        ct_slice = jax.lax.dynamic_index_in_dim(
-            ct, batch_loop_idx, axis=0, keepdims=False)
-        out_slice, vjpfun = jax.vjp(_do_single_call, qk_slice, v_slice)
-        qk_ct_slice, v_ct_slice = vjpfun(ct_slice)
-
-      new_vals = (batch_loop_idx + 1,)
-      if return_output:
-        out_accum = vals[1]
-        out_accum = jax.lax.dynamic_update_index_in_dim(
-            out_accum, out_slice, batch_loop_idx, axis=0)
-        new_vals = new_vals + (out_accum,)
-      if return_state:
-        buckets_accum = vals[2]
-        buckets_accum = jax.lax.dynamic_update_index_in_dim(
-            buckets_accum, buckets_slice, batch_loop_idx, axis=0)
-        new_vals = new_vals + (buckets_accum,)
-      if ct is not None:
-        qk_ct_accum, v_ct_accum = vals[-2:]
-        qk_ct_accum = jax.lax.dynamic_update_index_in_dim(
-            qk_ct_accum, qk_ct_slice, batch_loop_idx, axis=0)
-        v_ct_accum = jax.lax.dynamic_update_index_in_dim(
-            v_ct_accum, v_ct_slice, batch_loop_idx, axis=0)
-        new_vals = new_vals + (qk_ct_accum, v_ct_accum)
-
-      return new_vals
-
-    final_vals = jax.lax.while_loop(cond_fun, body_fun, init_vals)
-
-    if return_output:
-      out = final_vals[1]
+        w_q, w_k, w_v, w_o, b_q, b_k, b_v = weights
     else:
-      out = None
+      if self.share_qk:
+        w_q, w_v, w_o = weights
+      else:
+        w_q, w_k, w_v, w_o = weights
 
-    if return_state:
-      state = final_vals[2]
+    q = np.matmul(x, w_q)
+    k = None
+    if not self.share_qk:
+      k = np.matmul(x, w_k)
+    v = np.matmul(x, w_v)
+
+    if self.bias:
+      q = q + b_q
+      if not self.share_qk:
+        k = k + b_k
+      v = v + b_v
+
+    mask_fn = functools.partial(
+        mask_self_attention,
+        causal=self.causal, exclude_self=self.share_qk, masked=self.masked)
+    q_info = kv_info = tie_in(x, np.arange(q.shape[-2]))
+
+    assert (mask is not None) == self.masked
+    if self.masked:
+      # mask is a boolean array (True means "is valid token")
+      ones_like_mask = tie_in(x, np.ones_like(mask, dtype=np.int32))
+      kv_info = kv_info * np.where(mask, ones_like_mask, -ones_like_mask)
+
+    o, _ = attend(
+        q, k, v,
+        q_chunk_len=self.chunk_len,
+        kv_chunk_len=self.chunk_len,
+        n_chunks_before=self.n_chunks_before,
+        n_chunks_after=self.n_chunks_after,
+        mask_fn=mask_fn, q_info=q_info, kv_info=kv_info,
+        dropout=self.attention_dropout, rng=attend_rng,
+        )
+
+    out = np.matmul(o, w_o)
+    out = apply_broadcasted_dropout(out, self.output_dropout, output_rng)
+    return out, state
+
+  def incremental_forward_unbatched(self, x, mask=None, *,
+                                    q_start, q_len,
+                                    weights, state, rng, update_state):
+    del update_state
+    attend_rng, output_rng = fastmath.random.split(rng)
+    if self.share_qk:
+      w_q, w_v, w_o = weights
     else:
-      state = None
+      w_q, w_k, w_v, w_o = weights
 
-    if ct is not None:
-      input_ct = final_vals[-2:]
+    q_range = q_start + tie_in(x, jax.lax.iota(np.int32, q_len))
+    if q_len == 1:
+      # On TPU, np.matmul(a[:1], b) and np.matmul(a, b)[:1] are not
+      # floating-point equivalent, at least in non-jitted code. We correct the
+      # discrepancy by duplicating the slice. Floating-point noise may not be
+      # an issue when using models, but it makes it harder to write tests that
+      # compare fast and slow inference code for equivalence.
+      q = np.matmul(np.concatenate([x[q_range]] * 2, 0), w_q)
     else:
-      input_ct = None
-
-    return out, state, input_ct
-
-  def make_unit_length(self, x, epsilon=1e-6):
-    variance = np.mean(x**2, axis=-1, keepdims=True)
-    norm_inputs = x / np.sqrt(variance + epsilon)
-    return norm_inputs
-
-  def drop_for_hash(self, x, rng):
-    rate = self._drop_for_hash_rate
-    if self._mode == 'train' and rate > 0.0:
-      keep = math.random.bernoulli(rng, 1.0 - rate, x.shape)
-      return np.where(keep, x / (1.0 - rate), np.zeros_like(x))
-    return x
-
-  def _sample_rotation(self, shape, vecs, rng):
-    """Samples a rotation matrix, either randomly or based on `vecs`."""
-
-    if not self._data_rotation:
-      return jax.random.normal(rng, shape).astype('float32')
-
-    assert len(shape) == 3
-    unused_n_dim, n_hashes, r_div_2 = shape
-
-    assert len(vecs.shape) == 2
-    n_vecs = vecs.shape[0]
-
-    rng1, rng2 = math.random.split(rng, num=2)
-
-    # We need to sample 2 * n_hashes * r_div_2 vectors from `vecs` at random.
-    num_needed = 2 * n_hashes * r_div_2
-    if n_vecs < num_needed:
-      # shape = (n_hashes, r_div_2)
-      random_idxs_1 = jax.random.randint(
-          rng1, (n_hashes, r_div_2), 0, n_vecs)
-      random_idxs_2 = jax.random.randint(
-          rng2, (n_hashes, r_div_2), 0, n_vecs)
+      q = np.matmul(x[q_range], w_q)
+    if self.share_qk:
+      k = length_normalized(np.matmul(x, w_q))
     else:
-      # Sample without replacement.
-      shuffled_indices = jax.random.shuffle(rng1, np.arange(n_vecs))
-      random_idxs = np.reshape(shuffled_indices[:num_needed],
-                               (2, n_hashes, r_div_2))
-      random_idxs_1 = random_idxs[0]
-      random_idxs_2 = random_idxs[1]
+      k = np.matmul(x, w_k)
+    v = np.matmul(x, w_v)
 
-    if self._data_rotation_farthest:
-      # shape = (n_hashes * r_div_2, )
-      random_idxs_1 = np.reshape(random_idxs_1, (-1,))
-      random_vecs_1 = vecs[random_idxs_1]
+    mask_fn = functools.partial(
+        mask_self_attention,
+        causal=self.causal, exclude_self=self.share_qk, masked=self.masked)
+    q_info = q_range
+    kv_info = tie_in(x, np.arange(k.shape[-2]))
 
-      # Sample candidates for vec2s.
-      rng, subrng = math.random.split(rng)
-      # shape = (self._data_rotation_farthest_num, n_hashes * r_div_2)
-      candidate_idxs_2 = jax.random.randint(
-          subrng, (self._data_rotation_farthest_num, n_hashes * r_div_2), 0,
-          n_vecs)
-      candidate_vecs_2 = vecs[candidate_idxs_2]
-      # shape = candidate_idxs_2.shape
-      distances = -np.abs(
-          np.einsum('hd,chd->ch', random_vecs_1, candidate_vecs_2))
-      # shape = (n_hashes * r_div_2,)
-      farthest_idxs = np.argmax(distances, axis=0)
-      # candidate_vecs_2.shape
-      random_vecs_2 = candidate_vecs_2[farthest_idxs,
-                                       np.arange(n_hashes * r_div_2)]
-
-      # reshape to (n_hashes, r_div_2, n_dim)
-      random_vecs_1 = np.reshape(random_vecs_1, (n_hashes, r_div_2, -1))
-      random_vecs_2 = np.reshape(random_vecs_2, (n_hashes, r_div_2, -1))
+    if self.chunk_len is not None and q_len > self.chunk_len:
+      assert q_start == 0
+      assert q_len % self.chunk_len == 0
+      o, _ = attend(
+          q, k, v,
+          q_chunk_len=self.chunk_len,
+          kv_chunk_len=self.chunk_len,
+          n_chunks_before=self.n_chunks_before,
+          n_chunks_after=self.n_chunks_after,
+          mask_fn=mask_fn, q_info=q_info, kv_info=kv_info,
+          dropout=self.attention_dropout, rng=attend_rng,
+          )
     else:
-      # shape = (n_hashes, r_div_2, n_dim)
-      random_vecs_1 = vecs[random_idxs_1]
-      random_vecs_2 = vecs[random_idxs_2]
+      o, _ = attend(
+          q, k, v,
+          mask_fn=mask_fn, q_info=q_info, kv_info=kv_info,
+          dropout=self.attention_dropout, rng=attend_rng,
+          )
 
-    # shape = (n_dim, n_hashes, r_div_2)
-    return np.transpose(random_vecs_2 - random_vecs_1, axes=[2, 0, 1])
+    out = np.matmul(o, w_o)
+    if q_len == 1:
+      out = out[:1]
+    out = apply_broadcasted_dropout(out, self.output_dropout, output_rng)
+    return out, state
 
-  def hash_vectors(self, vecs, rng):
+
+class LSHSelfAttention(SelfAttention):
+  """LSH self-attention (second implementation)."""
+
+  def __init__(self,
+               n_heads=2, d_qk=64, d_v=64, share_qk='unused',
+               causal=False,
+               masked=False,
+               chunk_len=None, n_chunks_before=1, n_chunks_after=0,
+               n_hashes=1,
+               n_buckets=256,
+               mode='train',
+               predict_mem_len=2048, predict_drop_len=256,
+               attention_dropout=0.0,
+               output_dropout=0.0,
+               n_parallel_heads=1,
+               use_python_loop=False,
+               use_reference_code=False,
+               max_length_for_buckets=None,
+              ):
+    """Construct an LSH self-attention layer."""
+    super().__init__(
+        n_heads=n_heads, d_qk=d_qk, d_v=d_v, share_qk=True,
+        causal=causal,
+        masked=masked,
+        chunk_len=chunk_len,
+        n_chunks_before=n_chunks_before, n_chunks_after=n_chunks_after,
+        mode=mode,
+        predict_mem_len=predict_mem_len, predict_drop_len=predict_drop_len,
+        attention_dropout=attention_dropout,
+        output_dropout=output_dropout,
+        n_parallel_heads=n_parallel_heads,
+        use_python_loop=use_python_loop,
+        use_reference_code=use_reference_code,
+        )
+    self.n_hashes = n_hashes
+    self.n_buckets = n_buckets
+    self._max_length_for_buckets = max_length_for_buckets
+
+  def create_state_unbatched(self, input_signature, rng):
+    if isinstance(input_signature, (tuple, list)):
+      input_signature = input_signature[0]
+    # The `rng` argument passed to forward_unbatched is shared across all
+    # examples and heads. This facilitates using broadcasted dropout, which
+    # saves memory and hasn't been shown to hurt model quality. Even though the
+    # same sharing is likely to be safe when selecting random hash functions
+    # for LSH, we haven't run experiments to demonstrate this. To be on the safe
+    # side we include a per-head RNG in the state for the purpose of doing LSH.
+    if not self.incremental:
+      length = self._max_length_for_buckets or input_signature.shape[0]
+      buckets = np.zeros(self.n_hashes * length, dtype=np.int32)
+      return (buckets, rng)
+    else:
+      buckets = np.zeros(
+          self.n_hashes * self.predict_mem_len, dtype=np.int32)
+      buckets_idx = np.zeros((), dtype=np.int32)
+      return (buckets, buckets_idx, rng)
+
+  def hash_vectors(self, vecs, rng, mask=None):
     # See https://arxiv.org/pdf/1509.02897.pdf
     # We sample a different random rotation for each round of hashing to
     # decrease the probability of hash misses.
-    assert self.n_buckets % 2 == 0
-
-    # If we factorize the hash, find a factor dividing n_buckets nicely.
-    rot_size, factor_list = self.n_buckets, [self.n_buckets]
-    if self._factorize_hash:
-      # If we are given a list of factors, verify it and use later.
-      if isinstance(self._factorize_hash, list):
-        rot_size, product = 0, 1
-        factor_list = self._factorize_hash
-        for factor in factor_list:
-          assert factor % 2 == 0
-          product *= factor
-          rot_size += factor
-        assert product == self.n_buckets
-      else:  # Find one factor if just set to True.
-        # We want to represent self.n_buckets = factor * rest so that
-        # (1) both factor and rest are even, and (2) factor + rest is minimal.
-        # To compute this we start from factor = sqrt(n_buckets) and go down
-        # with it until we find one that satisfies the constraints above.
-        factor = int(python_math.sqrt(self.n_buckets))
-        while factor > 0 and not (
-            self.n_buckets % factor == 0 and
-            factor % 2 == 0 and
-            (self.n_buckets // factor) % 2 == 0):
-          factor -= 1
-        if factor > 2:  # Factor of 2 does not warrant the effort.
-          rot_size = factor + (self.n_buckets // factor)
-          factor_list = [factor, self.n_buckets // factor]
-
-    rotations_shape = (
-        vecs.shape[-1],
-        self.n_hashes if self._rehash_each_round else 1,
-        rot_size // 2)
-
-    rng = jax.lax.tie_in(vecs, rng)
-    rng, subrng = math.random.split(rng)
-    random_rotations = self._sample_rotation(rotations_shape, vecs, rng)
-
-    # TODO(lukaszkaiser): the dropout mask will be used for all rounds of
-    # hashing, so it's shared between them. Check if that's what we want.
-    dropped_vecs = self.drop_for_hash(vecs, subrng)
-    rotated_vecs = np.einsum('tf,fhb->htb', dropped_vecs, random_rotations)
-
-    if self._rehash_each_round:
-      if self._factorize_hash and len(factor_list) > 1:
-        # We factorized self.n_buckets as the product of factor_list.
-        # Get the buckets for them and combine.
-        buckets, cur_sum, cur_product = None, 0, 1
-        for factor in factor_list:
-          rv = rotated_vecs[..., cur_sum:cur_sum + (factor // 2)]
-          cur_sum += factor // 2
-          rv = np.concatenate([rv, -rv], axis=-1)
-          if buckets is None:
-            buckets = np.argmax(rv, axis=-1)
-          else:
-            buckets += cur_product * np.argmax(rv, axis=-1)
-          cur_product *= factor
-      else:
-        rotated_vecs = np.concatenate([rotated_vecs, -rotated_vecs], axis=-1)
-        buckets = np.argmax(rotated_vecs, axis=-1)
-      # buckets is now (self.n_hashes, seqlen). Next we add offsets so that
-      # bucket numbers from different hashing rounds don't overlap.
-      offsets = jax.lax.tie_in(buckets, np.arange(self.n_hashes))
-      offsets = np.reshape(offsets * self.n_buckets, (-1, 1))
-      buckets = np.reshape(buckets + offsets, (-1,))
+    if isinstance(self.n_buckets, int):
+      assert self.n_buckets % 2 == 0
+      rot_size = self.n_buckets
+      n_buckets = self.n_buckets
     else:
-      assert not self._factorize_hash
-      rotated_vecs = np.concatenate([rotated_vecs, -rotated_vecs], axis=-1)
-      # In this configuration, we map each item to the top self.n_hashes buckets
-      rotated_vecs = np.squeeze(rotated_vecs, 0)
-      bucket_range = jax.lax.tie_in(vecs, np.arange(rotated_vecs.shape[-1]))
-      bucket_range = np.reshape(bucket_range, (1, -1))
-      bucket_range = np.broadcast_to(bucket_range, rotated_vecs.shape)
+      # Factorize the hash if self.n_buckets is a list or tuple
+      rot_size, n_buckets = 0, 1
+      for factor in self.n_buckets:
+        assert factor % 2 == 0
+        rot_size += factor
+        n_buckets *= factor
 
-      _, buckets = jax.lax.sort_key_val(
-          rotated_vecs, bucket_range, dimension=-1)
-      buckets = buckets[:, -self.n_hashes:]
-      buckets = np.reshape(np.moveaxis(buckets, 0, -1), (-1,))
+    rotations_shape = (vecs.shape[-1], self.n_hashes, rot_size // 2)
+    rng = fastmath.stop_gradient(tie_in(vecs, rng))
+    random_rotations = fastmath.random.normal(rng, rotations_shape).astype(
+        np.float32)
+    if fastmath.backend_name() == 'jax':
+      rotated_vecs = np.einsum('tf,fhb->htb', vecs, random_rotations)
+    else:
+      random_rotations = np.reshape(random_rotations,
+                                    [-1, self.n_hashes * (rot_size // 2)])
+      rotated_vecs = np.dot(vecs, random_rotations)
+      rotated_vecs = np.reshape(rotated_vecs, [-1, self.n_hashes, rot_size//2])
+      rotated_vecs = np.transpose(rotated_vecs, (1, 0, 2))
+
+    if isinstance(self.n_buckets, int) or len(self.n_buckets) == 1:
+      rotated_vecs = np.concatenate([rotated_vecs, -rotated_vecs], axis=-1)
+      buckets = np.argmax(rotated_vecs, axis=-1)
+    else:
+      # Get the buckets for them and combine.
+      buckets, cur_sum, cur_product = None, 0, 1
+      for factor in self.n_buckets:
+        rv = rotated_vecs[..., cur_sum:cur_sum + (factor // 2)]
+        cur_sum += factor // 2
+        rv = np.concatenate([rv, -rv], axis=-1)
+        if buckets is None:
+          buckets = np.argmax(rv, axis=-1)
+        else:
+          buckets += cur_product * np.argmax(rv, axis=-1)
+        cur_product *= factor
+
+    if mask is not None:
+      n_buckets += 1  # Create an extra bucket for padding tokens only
+      buckets = np.where(mask[None, :], buckets, n_buckets - 1)
+
+    # buckets is now (self.n_hashes, seqlen). Next we add offsets so that
+    # bucket numbers from different hashing rounds don't overlap.
+    offsets = tie_in(buckets, np.arange(self.n_hashes))
+    offsets = np.reshape(offsets * n_buckets, (-1, 1))
+    buckets = np.reshape(buckets + offsets, (-1,))
 
     return buckets
 
-  def single_call(self, qk, v, buckets, rng=None):
-    # We use the same vector as both a query and a key.
-    seqlen = qk.shape[-2]
+  def forward_unbatched(self, x, mask=None, *, weights, state, rng,
+                        update_state):
+    attend_rng, output_rng = fastmath.random.split(rng)
+    w_q, w_v, w_o = weights
+
+    q = np.matmul(x, w_q)
+    v = np.matmul(x, w_v)
+
+    if update_state:
+      _, old_hash_rng = state
+      hash_rng, hash_subrng = fastmath.random.split(old_hash_rng)
+      buckets = self.hash_vectors(q, hash_subrng, mask)
+      s_buckets = buckets
+      if self._max_length_for_buckets:
+        length = self.n_hashes * self._max_length_for_buckets
+        if buckets.shape[0] < length:
+          s_buckets = np.concatenate(
+              [buckets, np.zeros(length - buckets.shape[0], dtype=np.int32)],
+              axis=0)
+      state = (s_buckets, hash_rng)
+    else:
+      buckets, _ = state
+      if self._max_length_for_buckets:
+        buckets = buckets[:self.n_hashes * x.shape[0]]
+
+    seqlen = x.shape[0]
     assert int(buckets.shape[0]) == self.n_hashes * seqlen
 
-    ticker = jax.lax.tie_in(qk, np.arange(self.n_hashes * seqlen))
+    ticker = tie_in(x, np.arange(self.n_hashes * seqlen))
     buckets_and_t = seqlen * buckets + (ticker % seqlen)
-    buckets_and_t = jax.lax.stop_gradient(buckets_and_t)
+    buckets_and_t = fastmath.stop_gradient(buckets_and_t)
 
     # Hash-based sort ("s" at the start of variable names means "sorted")
-    sbuckets_and_t, sticker = jax.lax.sort_key_val(
+    sbuckets_and_t, sticker = fastmath.sort_key_val(
         buckets_and_t, ticker, dimension=-1)
-    _, undo_sort = jax.lax.sort_key_val(sticker, ticker, dimension=-1)
-    sbuckets_and_t = jax.lax.stop_gradient(sbuckets_and_t)
-    sticker = jax.lax.stop_gradient(sticker)
-    undo_sort = jax.lax.stop_gradient(undo_sort)
+    _, undo_sort = fastmath.sort_key_val(sticker, ticker, dimension=-1)
+    sbuckets_and_t = fastmath.stop_gradient(sbuckets_and_t)
+    sticker = fastmath.stop_gradient(sticker)
+    undo_sort = fastmath.stop_gradient(undo_sort)
 
     st = (sticker % seqlen)
-    sqk = np.take(qk, st, axis=0)
+    sq = np.take(q, st, axis=0)
     sv = np.take(v, st, axis=0)
 
-    # Split off a "bin" axis so that attention only occurs within chunks.
-    bq_t = bkv_t = np.reshape(st, (self.n_hashes * self.n_bins, -1))
-    bqk = np.reshape(sqk, (self.n_hashes * self.n_bins, -1, sqk.shape[-1]))
-    bv = np.reshape(sv, (self.n_hashes * self.n_bins, -1, sv.shape[-1]))
-    bq_buckets = bkv_buckets = np.reshape(
-        sbuckets_and_t // seqlen, (self.n_hashes * self.n_bins, -1))
+    mask_fn = functools.partial(mask_self_attention, causal=self.causal,
+                                exclude_self=True, masked=self.masked)
+    q_info = st
 
-    # Hashing operates on unit-length vectors. Unnormalized query vectors are
-    # fine because they effectively provide a learnable temperature for the
-    # attention softmax, but normalizing keys is needed so that similarity for
-    # the purposes of attention correctly corresponds to hash locality.
-    bq = bqk
-    bk = self.make_unit_length(bqk)
+    assert (mask is not None) == self.masked
+    kv_info = None
+    if self.masked:
+      # mask is a boolean array (True means "is valid token")
+      smask = np.take(mask, st, axis=0)
+      ones_like_mask = tie_in(x, np.ones_like(smask, dtype=np.int32))
+      kv_info = q_info * np.where(smask, ones_like_mask, -ones_like_mask)
 
-    # Allow each chunk to attend within itself, and also one chunk back. Chunk
-    # boundaries might occur in the middle of a sequence of items from the
-    # same bucket, so this increases the chances of attending to relevant items.
-    # TODO(kitaev): benchmark whether XLA pad operation is noticeably faster.
-    def look_one_back(x):
-      if len(x.shape) == 2:
-        x_extra = np.concatenate([x[-1:, :], x[:-1, :]], axis=0)
-      else:
-        x_extra = np.concatenate([x[-1:, :, :], x[:-1, :, :]], axis=0)
-      return np.concatenate([x, x_extra], axis=1)
+    so, slogits = attend(
+        sq, k=None, v=sv,
+        q_chunk_len=self.chunk_len,
+        n_chunks_before=self.n_chunks_before,
+        n_chunks_after=self.n_chunks_after,
+        mask_fn=mask_fn, q_info=q_info, kv_info=kv_info,
+        dropout=self.attention_dropout, rng=attend_rng,
+        )
 
-    bk = look_one_back(bk)
-    bv = look_one_back(bv)
-    bkv_t = look_one_back(bkv_t)
-    bkv_buckets = look_one_back(bkv_buckets)
+    # np.take(so, undo_sort, axis=0); np.take(slogits, undo_sort, axis=0) would
+    # also work, but these helpers include performance optimizations for TPU.
+    o = permute_via_gather(so, undo_sort, sticker, axis=0)
+    logits = permute_via_sort(slogits, sticker, buckets_and_t, axis=-1)
 
-    # Dot-product attention.
-    dots = np.matmul(bq, np.swapaxes(bk, -1, -2)) / np.sqrt(bq.shape[-1])
-
-    # Causal masking
-    mask = jax.lax.convert_element_type(
-        jax.lax.lt(bq_t[:, :, None], bkv_t[:, None, :]),
-        np.float32)
-    dots = dots - 1e9 * mask
-
-    # Mask out attention to self except when no other targets are available.
-    self_mask = jax.lax.convert_element_type(
-        jax.lax.eq(bq_t[:, :, None], bkv_t[:, None, :]),
-        np.float32)
-    dots = dots - 1e5 * self_mask
-
-    # Mask out attention to other hash buckets.
-    if not self._attend_across_buckets:
-      bucket_mask = jax.lax.convert_element_type(
-          jax.lax.ne(bq_buckets[:, :, None], bkv_buckets[:, None, :]),
-          np.float32)
-      dots = dots - 1e7 * bucket_mask
-
-    # Don't double-count query-key pairs across multiple rounds of hashing.
-    # There are two possible strategies here. (1) The default is to count how
-    # many times a query-key pair is repeated, and to lower its log-prob
-    # correspondingly at each repetition. (2) When hard_k is set, the code
-    # instead masks all but the first occurrence of each query-key pair.
-    # TODO(kitaev): is one strategy faster or more numerically stable?
-    if not self._allow_duplicate_attention:
-      locs1 = undo_sort // bq_t.shape[-1]
-      locs2 = (locs1 + 1) % (self.n_hashes * self.n_bins)
-      if not self._attend_across_buckets:
-        locs1 = buckets * (self.n_hashes * self.n_bins) + locs1
-        locs2 = buckets * (self.n_hashes * self.n_bins) + locs2
-      locs = np.moveaxis(np.concatenate([
-          np.reshape(locs1, (self.n_hashes, seqlen)),
-          np.reshape(locs2, (self.n_hashes, seqlen)),
-      ], 0), 0, -1)  # produces shape (seqlen, 2 * self.n_hashes)
-      slocs = np.take(locs, st, axis=0)
-      b_locs = np.reshape(
-          slocs, (self.n_hashes * self.n_bins, -1, 2 * self.n_hashes))
-      # Queries always use the primary location (based on locs1).
-      b_locs1 = b_locs[:, :, None, :self.n_hashes]
-      if self._hard_k > 0:
-        range_n_hashes = jax.lax.tie_in(b_locs, np.arange(self.n_hashes))
-        nouse_locs = (range_n_hashes[:, None] > range_n_hashes[None, :])
-        nouse_locs = 2 * nouse_locs - 1  # 1 = use, -1 = don't use
-        nouse_locs = np.reshape(
-            np.broadcast_to(nouse_locs[:, None, :],
-                            (self.n_hashes, self.n_bins, self.n_hashes)),
-            (self.n_hashes * self.n_bins, 1, 1, self.n_hashes))
-        b_locs1 = b_locs1 * nouse_locs
-      bq_locs = np.broadcast_to(
-          b_locs1,
-          b_locs.shape[:2] + (2, self.n_hashes))
-      bq_locs = np.reshape(bq_locs, b_locs.shape)
-      bkv_locs = look_one_back(b_locs)
-
-      dup_counts = np.sum(
-          jax.lax.convert_element_type(
-              jax.lax.eq(bq_locs[:, :, None, :], bkv_locs[:, None, :, :]),
-              np.float32),
-          axis=-1)
-      assert dup_counts.shape == dots.shape
-      if self._hard_k > 0:
-        dots = dots - 1e7 * jax.lax.stop_gradient(dup_counts)
-      else:
-        dots = dots - jax.lax.stop_gradient(np.log(dup_counts + 1e-9))
-
-    # Each query only attends to the top k most relevant keys.
-    if self._hard_k > 0:
-      b_top_dots = np.sort(dots)[..., -self._hard_k:]  # Get the top k dots.
-      b_top_dots = jax.lax.stop_gradient(b_top_dots)
-      s_top_dots = np.reshape(b_top_dots, (-1, self._hard_k))
-      top_dots = np.take(s_top_dots, undo_sort, axis=0)
-
-      merged_top_dots = np.moveaxis(
-          np.reshape(top_dots, (self.n_hashes, seqlen, self._hard_k)), 0, -1)
-      merged_top_dots = np.reshape(merged_top_dots, (seqlen, -1))
-
-      dots_thresh = np.sort(merged_top_dots)[:, -self._hard_k]
-      # It's possible to compute the partition function at this point, but right
-      # now this codepath isn't set up for backprop, and there might also be
-      # issues computing it this way if two dot-products are exactly equal.
-
-      sdots_thresh = dots_thresh[st]
-      bdots_thresh = np.reshape(sdots_thresh, (self.n_hashes * self.n_bins, -1))
-      bdots_thresh = jax.lax.stop_gradient(bdots_thresh)
-
-      top_k_mask = jax.lax.convert_element_type(
-          dots < bdots_thresh[..., None], np.float32)
-      dots = dots - 1e7 * jax.lax.stop_gradient(top_k_mask)
-
-    # Softmax.
-    dots_logsumexp = math.logsumexp(dots, axis=-1, keepdims=True)
-    dots = np.exp(dots - dots_logsumexp)
-
-    if self._dropout > 0.0:
-      # Dropout is broadcast across the bin dimension
-      dropout_shape = (1, dots.shape[-2], dots.shape[-1])
-      keep_prob = jax.lax.tie_in(dots, 1.0 - self._dropout)
-      keep = math.random.bernoulli(rng, keep_prob, dropout_shape)
-      multiplier = keep.astype(dots.dtype) / jax.lax.tie_in(keep, keep_prob)
-      dots = dots * multiplier
-
-    bo = np.matmul(dots, bv)
-    so = np.reshape(bo, (-1, bo.shape[-1]))
-    slogits = np.reshape(dots_logsumexp, (-1,))
-
-    def unsort_for_output_impl(so, slogits):
-      o = np.take(so, undo_sort, axis=0)
-      # Sorting is considerably faster than gather, but first we need to get the
-      # XLA compiler to abandon the idea of fusing this sort with the input sort
-      # (which introduces a computation cycle and leads to a crash).
-      # TODO(kitaev): remove "sticker_" variable if XLA is fixed.
-      sticker_ = sticker + jax.lax.convert_element_type(
-          slogits[0] > 0, sticker.dtype)
-      _, logits = jax.lax.sort_key_val(sticker_, slogits, dimension=-1)
-      return o, logits
-
-    def unsort_for_output_vjp(so, slogits):
-      """Custom gradient for unsort_for_output."""
-      so = jax.lax.stop_gradient(so)
-      slogits = jax.lax.stop_gradient(slogits)
-      o, logits = unsort_for_output_impl(so, slogits)
-      def vjpfun(o_logits_grads):
-        so_grad = np.take(o_logits_grads[0], sticker, axis=0)
-        # TODO(kitaev): this exists to match the forward pass, but I'm not sure
-        # if it's actually required.
-        buckets_and_t_ = buckets_and_t + jax.lax.convert_element_type(
-            o_logits_grads[1][0] > 0, buckets_and_t.dtype)
-        _, slogits_grad = jax.lax.sort_key_val(
-            buckets_and_t_, o_logits_grads[1], dimension=-1)
-        return (so_grad, slogits_grad)
-      return (o, logits), vjpfun
-
-    unsort_for_output = jax.custom_transforms(unsort_for_output_impl)
-    jax.defvjp_all(unsort_for_output, unsort_for_output_vjp)
-    o, logits = unsort_for_output_impl(so, slogits)
-
-    if self.n_hashes == 1:
-      out = o
-    else:
+    if self.n_hashes > 1:
       o = np.reshape(o, (self.n_hashes, seqlen, o.shape[-1]))
       logits = np.reshape(logits, (self.n_hashes, seqlen, 1))
-      probs = np.exp(logits - math.logsumexp(logits, axis=0, keepdims=True))
-      out = np.sum(o * probs, axis=0)
+      probs = np.exp(logits - fastmath.logsumexp(logits, axis=0, keepdims=True))
+      o = np.sum(o * probs, axis=0)
 
-    assert out.shape == v.shape
-    return out
+    assert o.shape == (seqlen, w_v.shape[-1])
+    out = np.matmul(o, w_o)
+    out = apply_broadcasted_dropout(out, self.output_dropout, output_rng)
+    return out, state
 
-  def batch_predict(self, qk, v, state, rng=None):
-    assert not self._data_rotation, (
-        'Fast inference with data-dependent rotation is unsupported.')
-    assert self._hard_k == 0, 'Fast inference with hard_k is not implemented.'
-    assert self._dropout == 0.0, (
-        'Fast inference with dropout is not implemented.')
+  def incremental_forward_unbatched(self, x, *,
+                                    q_start, q_len,
+                                    weights, state, rng, update_state):
+    assert update_state, (
+        'This setting not supported (e.g. no backprop for fast inference)')
+    if isinstance(q_start, int) and q_start == 0 and q_len > 1:
+      if x.shape[0] % self.chunk_len == 0:
+        x_padded = x
+      else:
+        pad_amount = self.chunk_len - (x.shape[0] % self.chunk_len)
+        x_padded = np.pad(x, ((0, pad_amount), (0, 0)), mode='constant')
+      buckets, buckets_idx, hash_rng = state
+      q = np.matmul(x_padded, weights[0])
+      buckets_update = self.hash_vectors(q, hash_rng)
 
-    (ks, vs, mask, index, bucket_assignments, assignment_locs, hash_rng) = state
+      out, _ = self.forward_unbatched(
+          x_padded, weights=weights, state=(buckets_update, hash_rng),
+          rng=rng, update_state=False)
 
-    # TODO(kitaev): separate random projection for each attention head
-    assert qk.shape[1] == 1
-    batch_size = qk.shape[0]
+      out = out[:q_len]
+      buckets = np.reshape(buckets, (self.n_hashes, -1))
+      buckets_update = np.reshape(
+          buckets_update, (self.n_hashes, -1))[:, :q_len]
+      if q_len > self.predict_mem_len:
+        buckets_update = buckets_update[:, -self.predict_mem_len:]  # pylint: disable=invalid-unary-operand-type
+      buckets = jax.lax.dynamic_update_slice_in_dim(
+          buckets, buckets_update, q_start, axis=1)
+      buckets = np.reshape(buckets, (-1,))
 
-    buckets = np.reshape(
-        self.hash_vectors(np.squeeze(qk, 1), hash_rng),
-        (self.n_hashes, batch_size))
-    buckets = np.swapaxes(buckets, 0, 1)
+      return out, (buckets, buckets_idx + q_len, hash_rng)
 
-    k = self.make_unit_length(qk)
-    ks = jax.ops.index_update(ks, jax.ops.index[:, index, :], k[:, 0, :])
-    vs = jax.ops.index_update(vs, jax.ops.index[:, index, :], v[:, 0, :])
-    # Mask out attention to self except when no other targets are available.
-    # Invalid elements are masked at -1e9 strength, rather than -1e5.
-    cur_mask = jax.ops.index_update(mask, jax.ops.index[:, index], -1e5)
-    mask = jax.ops.index_update(mask, jax.ops.index[:, index], 0.0)
+    # This codepath is for handling one token at a time.
+    assert q_len == 1
+    buckets, buckets_idx, hash_rng = state
 
-    # Update bucket_assignments and assignment_locs.
-    batch_idxs = np.broadcast_to(
-        np.reshape(np.arange(batch_size), (-1, 1)), buckets.shape)
-    batch_offsets = batch_idxs * self.n_hashes * self.n_buckets
-    batch_bucket_idxs = np.reshape(batch_offsets + buckets, (-1,))
-    update_locs = assignment_locs[batch_bucket_idxs]
-    bucket_assignments = jax.ops.index_update(
-        bucket_assignments,
-        jax.ops.index[batch_bucket_idxs, update_locs],
-        np.broadcast_to(index, batch_bucket_idxs.shape))
-    assignment_locs = jax.ops.index_update(
-        assignment_locs,
-        jax.ops.index[batch_bucket_idxs],
-        (update_locs + 1) % self._bucket_capacity_for_inference)
+    def roll_buckets(buckets):
+      buckets = np.reshape(buckets, (self.n_hashes, -1))
+      new_buckets = np.concatenate(
+          [buckets, np.zeros((self.n_hashes, self.predict_drop_len),
+                             dtype=buckets.dtype)
+          ], axis=1)
+      new_buckets = jax.lax.dynamic_slice_in_dim(
+          new_buckets, buckets_idx - q_start, buckets.shape[-1], axis=1)
+      new_buckets = np.reshape(new_buckets, (-1,))
+      return new_buckets
 
-    # kv_refs: batch_size, n_kv
-    kv_refs = bucket_assignments[batch_bucket_idxs]
-    kv_refs = np.reshape(kv_refs, (batch_size, -1))
-    kv_refs = np.sort(kv_refs, -1)
+    buckets = jax.lax.cond(
+        pred=buckets_idx > q_start,
+        true_operand=buckets,
+        true_fun=roll_buckets,
+        false_operand=buckets,
+        false_fun=lambda x: x,
+    )
 
-    # cur_mask: batch_size, 1, n_kv
-    # cur_k: batch_size, n_kv, d_qk
-    # cur_v: batch_size, n_kv, d_v
-    cur_mask = np.take_along_axis(cur_mask, kv_refs, 1)[:, None, :]
-    # The low-level implementation of np.take_along_axis runs out of memory on
-    # TPU, so we perform the equivalent with manual index arithmetic.
-    # cur_k = np.take_along_axis(ks, kv_refs[:, :, None], 1)
-    # cur_v = np.take_along_axis(vs, kv_refs[:, :, None], 1)
-    ref_offsets = jax.lax.tie_in(kv_refs, np.arange(batch_size))
-    kv_refs_flat = kv_refs + np.reshape(
-        ref_offsets, (-1, 1)) * ks.shape[1]
-    kv_refs_flat = np.reshape(kv_refs_flat, (-1,))
-    cur_k = np.reshape(ks, (-1, ks.shape[-1]))[kv_refs_flat]
-    cur_v = np.reshape(vs, (-1, vs.shape[-1]))[kv_refs_flat]
-    cur_k = np.reshape(cur_k, (batch_size, -1, ks.shape[-1]))
-    cur_v = np.reshape(cur_v, (batch_size, -1, vs.shape[-1]))
+    attend_rng, output_rng = fastmath.random.split(rng)
+    w_q, w_v, w_o = weights
 
-    dots = np.matmul(qk, np.swapaxes(cur_k, -1, -2)) / np.sqrt(qk.shape[-1])
-    dots = dots + cur_mask
+    q_range = q_start + tie_in(x, jax.lax.iota(np.int32, q_len))
+    # On TPU, np.matmul(a[:1], b) and np.matmul(a, b)[:1] are not
+    # floating-point equivalent, at least in non-jitted code. We correct the
+    # discrepancy by duplicating the slice. Floating-point noise may not be
+    # an issue when using models, but it makes it harder to write tests that
+    # compare fast and slow inference code for equivalence.
+    q = np.matmul(np.concatenate([x[q_range]] * 2, 0), w_q)
 
-    if not self._allow_duplicate_attention:
-      no_repeat_mask = jax.lax.convert_element_type(
-          kv_refs == np.pad(
-              kv_refs, [[0, 0], [1, 0]], constant_values=-99)[:, :-1],
-          np.float32)
-      dots = dots - 1e7 * no_repeat_mask[:, None, :]
+    q_buckets = self.hash_vectors(q, hash_rng)
+    q_buckets = np.reshape(q_buckets, (self.n_hashes, 2))[:, :q_len]
 
-    # Softmax.
-    dots_logsumexp = math.logsumexp(dots, axis=-1, keepdims=True)
-    dots = np.exp(dots - dots_logsumexp)
+    unflattened_buckets = jax.lax.dynamic_update_slice_in_dim(
+        np.reshape(buckets, (self.n_hashes, -1)),
+        q_buckets, q_start, axis=1)
+    buckets = np.reshape(unflattened_buckets, (-1,))
+    is_valid_target = np.any(unflattened_buckets == q_buckets, axis=0)
 
-    out = np.matmul(dots, cur_v)  # batch_size, 1, d_v
-    assert out.shape == v.shape
+    assert q_buckets.shape[-1] == 1  # Is true when q_len == 1
+    seqlen = x.shape[0]
+    arange_seqlen = np.arange(seqlen)
+    kv_priorities = np.where(
+        arange_seqlen > (q_start + q_len),
+        -(seqlen + arange_seqlen), arange_seqlen)
+    kv_priorities = kv_priorities + seqlen * is_valid_target.astype(np.int32)
+    _, kv_indices = fastmath.sort_key_val(kv_priorities, arange_seqlen)
+    kv_indices = kv_indices[
+        -self.n_hashes * self.chunk_len * (1 + self.n_chunks_before):]
+    assert self.n_chunks_after == 0
 
-    new_state = (
-        ks, vs, mask, index + 1, bucket_assignments, assignment_locs, hash_rng)
-    return out, new_state
+    x_attend_to = x[kv_indices]
+    k = length_normalized(np.matmul(x_attend_to, w_q))
+    v = np.matmul(x_attend_to, w_v)
+
+    mask_fn = functools.partial(
+        mask_self_attention, causal=True, masked=True, exclude_self=True)
+    q_info = q_start + np.arange(q_len)
+    kv_info = kv_indices
+    # TODO(kitaev): is it better to mask out attention across buckets?
+    # kv_info = np.where(is_valid_target[kv_indices], kv_indices, -kv_indices)
+    o, _ = attend(
+        q, k, v,
+        mask_fn=mask_fn, q_info=q_info, kv_info=kv_info,
+        dropout=self.attention_dropout, rng=attend_rng,
+        )
+
+    out = np.matmul(o, w_o)
+    if q_len == 1:
+      out = out[:1]
+    out = apply_broadcasted_dropout(out, self.output_dropout, output_rng)
+    buckets_idx = np.array(q_start + q_len, dtype=buckets_idx.dtype)
+    return out, (buckets, buckets_idx, hash_rng)
+
+
+class EncDecAttention(EfficientAttentionBase):
+  """Memory-efficient encoder-decoder attention."""
+
+  def __init__(self,
+               n_heads=2, d_qk=64, d_v=64,
+               masked=True,
+               mode='train',
+               attention_dropout=0.0,
+               output_dropout=0.0,
+               n_parallel_heads=None,
+               use_python_loop=False,
+               use_reference_code=False,
+              ):
+    super().__init__(
+        n_heads=n_heads,
+        n_in=(3 if masked else 2),
+        n_parallel_heads=n_parallel_heads,
+        use_python_loop=use_python_loop,
+        use_reference_code=use_reference_code,
+        )
+    self.d_qk = d_qk
+    self.d_v = d_v
+    self.masked = masked
+    self.mode = mode
+    if mode == 'train':
+      self.attention_dropout = attention_dropout
+      self.output_dropout = output_dropout
+    else:
+      self.attention_dropout = 0.0
+      self.output_dropout = 0.0
+
+  def _kernel_initializer(self, shape, rng):
+    # Attention uses Glorot uniform initalization with respect to the *total*
+    # dimension of queries/key/values across all heads. We initialize one head
+    # at a time in this class, so init.GlorotUniformInitializer won't work.
+    # This initialization type is for parity with previous Trax & tensor2tensor
+    # Transformers; it's not clear if it's strictly needed for model accuracy.
+    lim = np.sqrt(6.0 / (shape[0] + shape[1] * self.n_heads))
+    return fastmath.random.uniform(rng, shape, np.float32, -lim, lim)
+
+  def create_weights_unbatched(self, input_signature, rng):
+    d_model = input_signature[0].shape[-1]
+    d_kv_antecedent = input_signature[1].shape[-1]
+    rng_q, rng_k, rng_v, rng_o = fastmath.random.split(rng, 4)
+    w_q = self._kernel_initializer((d_model, self.d_qk), rng_q)
+    w_k = self._kernel_initializer((d_kv_antecedent, self.d_qk), rng_k)
+    w_v = self._kernel_initializer((d_kv_antecedent, self.d_v), rng_v)
+    w_o = np.transpose(self._kernel_initializer((d_model, self.d_v), rng_o))
+    return (w_q, w_k, w_v, w_o)
+
+  def forward_unbatched(self, q_antecedent, kv_antecedent, mask=None, *,
+                        weights, state, rng, update_state):
+    del update_state
+    attend_rng, output_rng = fastmath.random.split(rng)
+    w_q, w_k, w_v, w_o = weights
+
+    q = np.matmul(q_antecedent, w_q)
+    k = np.matmul(kv_antecedent, w_k)
+    v = np.matmul(kv_antecedent, w_v)
+
+    if not self.masked:
+      assert mask is None
+      q_info = kv_info = mask_fn = None
+    else:
+      # mask is a boolean array (True means "is valid token")
+      assert mask is not None
+      q_info = None
+      kv_info = (~mask).astype(np.int32)  # pylint: disable=invalid-unary-operand-type
+      def mask_fn(dots, q_info, kv_info):
+        del q_info
+        mask = kv_info.astype(np.float32)
+        dots = dots - 1e9 * mask
+        return dots
+
+    o, _ = attend(
+        q, k, v,
+        mask_fn=mask_fn, q_info=q_info, kv_info=kv_info,
+        dropout=self.attention_dropout, rng=attend_rng,
+        )
+
+    out = np.matmul(o, w_o)
+    out = apply_broadcasted_dropout(out, self.output_dropout, output_rng)
+    return out, state

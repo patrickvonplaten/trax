@@ -18,12 +18,91 @@
 
 import logging
 import jax
-import numpy as onp
+import numpy as np
 import trax
-from trax import math
+from trax import fastmath
+from trax.fastmath import numpy as jnp
 from trax.layers import base as layer_base
 from trax.layers import initializers as init
-from trax.math import numpy as np
+
+
+class AxialPositionalEncoding(layer_base.Layer):
+  """Axial positional encoding."""
+  # TODO(kitaev): support variable-length sequences.
+
+  def __init__(self, shape=(64, 64, 3), d_embs=(384, 384, 256),
+               kernel_initializer=init.RandomNormalInitializer(1.0),
+               dropout=0.0, dropout_broadcast_dims=(), mode='train'):
+    super(AxialPositionalEncoding, self).__init__()
+    self._kernel_initializer = kernel_initializer
+    assert len(shape) == len(d_embs)
+    self._shape = shape
+    self._d_embs = d_embs
+
+    if dropout >= 1.0:
+      raise ValueError('Dropout rates must be lower than 1.')
+    if mode == 'train':
+      self._dropout = dropout
+    else:
+      self._dropout = 0.0
+    self._dropout_broadcast_dims = dropout_broadcast_dims
+    self._mode = mode
+
+  def forward(self, inputs):
+    rng, state = self.rng, self.state
+    embs = []
+    for ax_emb in self.weights:
+      ax_emb = jnp.broadcast_to(
+          ax_emb, (inputs.shape[0],) + self._shape + (ax_emb.shape[-1],))
+      embs.append(ax_emb)
+
+    if self._mode == 'predict':
+      assert self._dropout == 0.0
+      emb = jnp.concatenate(embs, -1)
+      emb = jnp.reshape(emb, (inputs.shape[0], -1, emb.shape[-1]))
+      emb = jax.lax.dynamic_slice_in_dim(emb, state, inputs.shape[1], axis=1)
+      self.state = state + inputs.shape[1]
+      return inputs + emb
+    elif self._dropout == 0:
+      # TODO(kitaev): concat-then-reshape (as is the case with dropout enabled)
+      # leads to memory blow-up on TPU.
+      # emb = jnp.concatenate(embs, -1)
+      # return inputs + jnp.reshape(emb, inputs.shape), state
+      return inputs + jnp.concatenate(
+          [jnp.reshape(emb, inputs.shape[:-1] + (emb.shape[-1],))
+           for emb in embs
+          ], -1)
+    else:
+      emb = jnp.concatenate(embs, -1)
+      noise_shape = list(emb.shape)
+      for dim in self._dropout_broadcast_dims:
+        noise_shape[dim] = 1
+      keep_prob = 1.0 - self._dropout
+      if fastmath.backend_name() == 'jax':
+        keep_prob = jax.lax.tie_in(
+            inputs, jnp.full((), keep_prob, dtype=inputs.dtype))
+      keep = fastmath.random.bernoulli(rng, keep_prob, tuple(noise_shape))
+      multiplier = keep.astype(inputs.dtype) / keep_prob
+      return inputs + jnp.reshape(emb * multiplier, inputs.shape)
+
+  def init_weights_and_state(self, input_signature):
+    d_feature = input_signature.shape[-1]
+    if sum(self._d_embs) != d_feature:
+      raise ValueError(
+          f'sum(self._d_embs) != d_feature: '
+          f'sum({self._d_embs}) vs d_feature: {d_feature}')
+
+    rngs = fastmath.random.split(self.rng, len(self._d_embs))
+    weights = []
+    for ax, (ax_rng, d_emb) in enumerate(zip(rngs, self._d_embs)):
+      ax_shape = [1] * len(self._shape)
+      ax_shape[ax] = self._shape[ax]
+      ax_shape = (1,) + tuple(ax_shape) + (d_emb,)
+      ax_emb = self._kernel_initializer(ax_shape, ax_rng)
+      weights.append(ax_emb)
+
+    self.state = 0 if self._mode == 'predict' else layer_base.EMPTY_STATE
+    self.weights = tuple(weights)
 
 
 class FixedBasePositionalEncoding(layer_base.Layer):
@@ -40,18 +119,18 @@ class FixedBasePositionalEncoding(layer_base.Layer):
     self._start_from_zero_one_in = start_from_zero_one_in
     self._base_dropout_one_in = base_dropout_one_in
 
-  def forward_with_state(self, x, weights=layer_base.EMPTY_WEIGHTS,
-                         state=layer_base.EMPTY_STATE, rng=None, **kwargs):
+  def forward(self, x):
+    rng = self.rng
     batch_size, length = x.shape[0], x.shape[1]
     max_pos = min(self._bases)**self._n_digits
-    rng1, rng2, rng3 = math.random.split(rng, 3)
+    rng1, rng2, rng3 = fastmath.random.split(rng, 3)
     assert length < max_pos, 'length (%d) >= max_pos (%d)' % (length, max_pos)
-    positions = np.arange(0, length)[None, :]
+    positions = jnp.arange(0, length)[None, :]
     if self._mode == 'train':
       # In 1% of training cases still start from 0 to be exactly as in eval.
       start_from_nonzero = jax.random.randint(
           rng1, (batch_size,), 0, self._start_from_zero_one_in)
-      start_from_nonzero = np.minimum(1, start_from_nonzero)
+      start_from_nonzero = jnp.minimum(1, start_from_nonzero)
       random_start = jax.random.randint(rng2, (batch_size,), 0, max_pos-length)
       random_start *= start_from_nonzero
       positions += random_start[:, None]
@@ -60,30 +139,30 @@ class FixedBasePositionalEncoding(layer_base.Layer):
       pos_embeddings = []
       cur_positions = positions
       for i in range(self._n_digits):
-        cur_indices = np.mod(cur_positions, base)
+        cur_indices = jnp.mod(cur_positions, base)
         cur_positions = cur_positions // base
-        s = weights[bn][i]
-        pos_embeddings.append(cur_indices.astype(np.float32)[:, :, None] * s)
-      embeddings = np.concatenate(pos_embeddings, axis=-1)
+        s = self.weights[bn][i]
+        pos_embeddings.append(cur_indices.astype(jnp.float32)[:, :, None] * s)
+      embeddings = jnp.concatenate(pos_embeddings, axis=-1)
       if self._mode == 'train':
         base_dropout = jax.random.randint(
             rng3, (batch_size,), 0, self._base_dropout_one_in)
-        base_dropout = np.minimum(1, base_dropout).astype(np.float32)
+        base_dropout = jnp.minimum(1, base_dropout).astype(jnp.float32)
         embeddings *= base_dropout[:, None, None]
       res.append(embeddings)
-    res = sum(res) + np.zeros_like(x)
-    return np.concatenate([x, res], axis=-1), state
+    res = sum(res) + jnp.zeros_like(x)
+    return jnp.concatenate([x, res], axis=-1)
 
-  def new_weights(self, input_signature):
+  def init_weights_and_state(self, input_signature):
     d_feature = input_signature.shape[-1]
     assert d_feature % self._n_digits == 0
     d_weight = d_feature // self._n_digits
-    return [[self._initializer((1, d_weight), rng)
-             for rng in self.new_rngs(self._n_digits)]
-            for _ in self._bases]
+    self.weights = [[self._initializer((1, d_weight), rng)
+                     for rng in fastmath.random.split(self.rng, self._n_digits)]
+                    for _ in self._bases]
 
 
-def threefry_2x32_prf(key, x: np.ndarray) -> np.ndarray:
+def threefry_2x32_prf(key, x: jnp.ndarray) -> jnp.ndarray:
   """Apply the threefry PRF to an array of inputs.
 
   This function is vectorized over x.
@@ -96,15 +175,15 @@ def threefry_2x32_prf(key, x: np.ndarray) -> np.ndarray:
   Returns:
     y: uint32[..., 2] the outputs
   """
-  if not (key.shape == (2,) and key.dtype == np.uint32):
+  if not (key.shape == (2,) and key.dtype == jnp.uint32):
     raise TypeError('key must be uint32[2]', key)
-  if not (x.shape[-1:] == (2,) and x.dtype == np.uint32):
+  if not (x.shape[-1:] == (2,) and x.dtype == jnp.uint32):
     raise TypeError('x must be uint32[..., 2]', x)
   # Threefry-2x32 expects this weird format:
-  x_3f = np.moveaxis(x, source=-1, destination=0).flatten()
+  x_3f = jnp.moveaxis(x, source=-1, destination=0).flatten()
   y_3f = jax.random.threefry_2x32(key, x_3f)
-  y = np.moveaxis(
-      np.reshape(y_3f, (2,) + x.shape[:-1]), source=0, destination=-1)
+  y = jnp.moveaxis(
+      jnp.reshape(y_3f, (2,) + x.shape[:-1]), source=0, destination=-1)
   return y
 
 
@@ -121,15 +200,15 @@ def threefry_2x32_prange(key, lo: int = 0, hi: int = 2):
   Returns:
     keys: uint32[hi - lo, 2] the split keys
   """
-  if not (key.shape == (2,) and key.dtype == np.uint32):
+  if not (key.shape == (2,) and key.dtype == jnp.uint32):
     raise ValueError('key must be uint32[2]')
   if not hi < 2**32:
     # You shouldn't really be using more than half the key size anyways.
     raise NotImplementedError('only 32-bit sizes are supported')
   # Create a 64-bit counter:
-  i_lo = np.arange(lo, hi, dtype=np.uint32)
-  i_hi = np.zeros_like(i_lo)
-  i = np.stack([i_lo, i_hi], axis=-1)
+  i_lo = jnp.arange(lo, hi, dtype=jnp.uint32)
+  i_hi = jnp.zeros_like(i_lo)
+  i = jnp.stack([i_lo, i_hi], axis=-1)
   return threefry_2x32_prf(key, i)
 
 
@@ -163,7 +242,6 @@ class InfinitePositionalEncoding(layer_base.Layer):
     super().__init__()
     if transform not in ('any', 'diag', 'none'):
       raise ValueError(transform)
-    # self._noise_rng = self.new_rng()
     self._noise_rng = jax.random.split(jax.random.PRNGKey(234234535))[0]
     assert self._noise_rng is not None
     self._noise = None
@@ -192,7 +270,7 @@ class InfinitePositionalEncoding(layer_base.Layer):
       noise = threefry_2x32_prange(self._noise_rng, 0, new_length * depth)
       noise = noise.reshape((new_length, depth, 2))[:, :, 0]
       # Normalize to [-sqrt(3), sqrt(3)]:
-      noise = noise.astype(np.float32) / 2**31 - 1
+      noise = noise.astype(jnp.float32) / 2**31 - 1
       noise = noise * 3**.5
       # TODO(tying): use multiscale noise for memory-efficient sampling
       noise = noise.cumsum(axis=0)
@@ -217,7 +295,7 @@ class InfinitePositionalEncoding(layer_base.Layer):
     # Make the stddev around 1 after 1/drift.
     noise = noise * self._drift**.5
 
-    t, c = onp.mgrid[lo:hi, :depth]
+    t, c = np.mgrid[lo:hi, :depth]
     # Make even channels cos, odd channels sin:
     c_div_2, c_mod_2 = divmod(c, 2)
     # Off-by-one correction for odd depth:
@@ -225,37 +303,37 @@ class InfinitePositionalEncoding(layer_base.Layer):
     if depth > 2:
       drift = drift**(((depth+1)//2)/(depth//2))
     # Spend roughly half the frequencies on noise:
-    freq = np.geomspace(.5, .5 * drift**2, num=(depth + 1) // 2)[c_div_2]
+    freq = jnp.geomspace(.5, .5 * drift**2, num=(depth + 1) // 2)[c_div_2]
     cycles = c_mod_2 / 4 + freq * t + noise[:, c_div_2[0, :]] / 4
     assert cycles.shape == (hi - lo, depth), cycles.shape
 
     # Get random phases:
     if self._affine:
       assert rng is not None
-      cycles = cycles + trax.math.random.uniform(
+      cycles = cycles + trax.fastmath.random.uniform(
           rng, (1, depth,), minval=0, maxval=1)
 
     # Convert from cycles to radians:
-    embeddings = np.cos(np.pi * 2 * cycles)
+    embeddings = jnp.cos(jnp.pi * 2 * cycles)
 
     # Set the last channels to the time bin features:
     if self._time_bin_length is not None:
       inter_bin_idx, intra_bin_idx = divmod(t[:, -1:], self._time_bin_length)
       bin_parity = inter_bin_idx % 2
       bin_fraction = intra_bin_idx / self._time_bin_length
-      embeddings = np.concatenate(
+      embeddings = jnp.concatenate(
           [
               embeddings[:, :-3],
               1 / (1 + inter_bin_idx),
               bin_fraction,
-              bin_parity.astype(np.float32),
+              bin_parity.astype(jnp.float32),
           ], -1)
 
     assert embeddings.shape == (hi - lo, depth), embeddings.shape
     return embeddings
 
-  def forward_with_state(self, inputs, weights=layer_base.EMPTY_WEIGHTS,
-                         state=layer_base.EMPTY_STATE, rng=None, **kwargs):
+  def forward(self, inputs):
+    rng, state = self.rng, self.state
     d_feature = inputs.shape[-1]
     input_len = inputs.shape[-2]
 
@@ -265,37 +343,36 @@ class InfinitePositionalEncoding(layer_base.Layer):
       lo = index.min()
       hi = index.max() + 1
       emb = self._get_embeddings(lo=lo, hi=hi, depth=d_feature, rng=predict_rng)
-      emb = emb[index - lo, np.newaxis, :]
+      emb = emb[index - lo, jnp.newaxis, :]
       index = index + 1
       state = index, predict_rng
     else:
       emb = self._get_embeddings(lo=0, hi=input_len, depth=d_feature, rng=rng)
-      emb = emb[np.newaxis, :input_len, :]
+      emb = emb[jnp.newaxis, :input_len, :]
     # TODO(tying): check that XLA swaps matmul(slice(x)) -> slice(matmul(x)),
     # or inline this code into get_embeddings/get_noise
     if self._transform == 'diag':
-      emb = emb * jax.nn.softplus(weights)
+      emb = emb * jax.nn.softplus(self.weights)
     elif self._transform == 'any':
-      emb = emb @ weights
-    return inputs + emb, state
+      emb = emb @ self.weights
+    self.state = state
+    return inputs + emb
 
-  def new_weights_and_state(self, input_signature):
+  def init_weights_and_state(self, input_signature):
     d_feature = input_signature.shape[-1]
     if self._transform == 'diag':
       # Initialize it to a small value because JAX has a bug in softplus.
-      scale_isoftplus = np.zeros((d_feature,), dtype=np.float32) + 1e-4
+      scale_isoftplus = jnp.zeros((d_feature,), dtype=jnp.float32) + 1e-4
       weights = scale_isoftplus
     elif self._transform == 'any':
       ortho = trax.layers.initializers.OrthogonalInitializer()
-      weights = ortho((d_feature, d_feature), self.new_rng())
+      weights = ortho((d_feature, d_feature), self.rng)
     else:
       weights = layer_base.EMPTY_WEIGHTS
     if self._mode == 'predict':
       batch_size = input_signature.shape[0]
-      state = np.zeros((batch_size,), dtype=np.int32), self.new_rng()
-    else:
-      state = layer_base.EMPTY_STATE
-    return weights, state
+      self.state = jnp.zeros((batch_size,), dtype=jnp.int32), self.rng
+    self.weights = weights
 
 
 class TimeBinPositionalEncoding(layer_base.Layer):
@@ -317,7 +394,7 @@ class TimeBinPositionalEncoding(layer_base.Layer):
     """Get embeddings float[..., num_features].
 
     Args:
-      t: int[...] position (i.e. np.arange(..., np.int32))
+      t: int[...] position (i.e. jnp.arange(..., jnp.int32))
 
     Returns:
       embeddings: float[..., num_features]
@@ -325,43 +402,42 @@ class TimeBinPositionalEncoding(layer_base.Layer):
     inter_bin_idx, intra_bin_idx = divmod(t, self._time_bin_length)
     bin_parity = inter_bin_idx % 2
     bin_fraction = intra_bin_idx / self._time_bin_length
-    embeddings = np.stack([
+    embeddings = jnp.stack([
         1 / (1 + inter_bin_idx),
         bin_fraction,
-        bin_parity.astype(np.float32),
+        bin_parity.astype(jnp.float32),
     ], -1)
 
     assert embeddings.shape == t.shape + (self.num_features,), embeddings.shape
     return embeddings
 
-  def forward_with_state(self, inputs, weights=layer_base.EMPTY_WEIGHTS,
-                         state=layer_base.EMPTY_STATE, rng=None, **kwargs):
+  def forward(self, inputs):
+    state = self.state
     depth = inputs.shape[-1]
 
     if self._mode == 'predict':
       emb = self._get_embeddings(t=state)
-      emb = emb[:, np.newaxis, :]
+      emb = emb[:, jnp.newaxis, :]
       state = state + 1
     else:
       input_len = inputs.shape[-2]
-      emb = self._get_embeddings(t=np.arange(input_len, dtype=np.int32))
+      emb = self._get_embeddings(t=jnp.arange(input_len, dtype=jnp.int32))
       # Leave batch axis as 1 for broadcasting:
-      emb = emb[np.newaxis, :, :]
-      emb = np.broadcast_to(emb, inputs.shape[:-1] + (3,))
+      emb = emb[jnp.newaxis, :, :]
+      emb = jnp.broadcast_to(emb, inputs.shape[:-1] + (3,))
 
     # Replace the last num_features channels of input.
-    inputs = np.concatenate([inputs[..., :-self.num_features], emb], -1)
+    inputs = jnp.concatenate([inputs[..., :-self.num_features], emb], -1)
     if inputs.shape[-1] > depth:
       logging.warning(
           'dropping feature(s): %d down to %d', inputs.shape[-1], depth)
       inputs = inputs[..., -depth:]
 
     assert inputs.shape[-1] == depth, inputs.shape
-    return inputs, state
+    self.state = state
+    return inputs
 
-  def new_weights_and_state(self, input_signature):
+  def init_weights_and_state(self, input_signature):
     if self._mode == 'predict':
       batch_size = input_signature.shape[0]
-      return layer_base.EMPTY_WEIGHTS, np.zeros((batch_size,), dtype=np.int32)
-    else:
-      return layer_base.EMPTY_WEIGHTS, layer_base.EMPTY_STATE
+      self.state = jnp.zeros((batch_size,), dtype=jnp.int32)

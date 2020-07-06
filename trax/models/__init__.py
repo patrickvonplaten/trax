@@ -19,7 +19,6 @@ from __future__ import division
 from __future__ import print_function
 
 import gin
-import six
 
 from trax.models import atari_cnn
 from trax.models import mlp
@@ -30,7 +29,6 @@ from trax.models import rnn
 from trax.models import transformer
 from trax.models.reformer import reformer
 from trax.models.research import bert
-from trax.models.research import position_lookup_transformer
 from trax.models.research import skipping_transformer
 
 
@@ -53,6 +51,7 @@ NeuralGPU = model_configure(neural_gpu.NeuralGPU)
 Reformer = model_configure(reformer.Reformer)
 ReformerLM = model_configure(reformer.ReformerLM)
 ReformerShortenLM = model_configure(reformer.ReformerShortenLM)
+ReformerNoEncDecAttention = model_configure(reformer.ReformerNoEncDecAttention)
 Resnet50 = model_configure(resnet.Resnet50)
 SkippingTransformerLM = model_configure(
     skipping_transformer.SkippingTransformerLM)
@@ -60,10 +59,12 @@ Transformer = model_configure(transformer.Transformer)
 TransformerDecoder = model_configure(transformer.TransformerDecoder)
 TransformerEncoder = model_configure(transformer.TransformerEncoder)
 TransformerLM = model_configure(transformer.TransformerLM)
+TransformerNoEncDecAttention = model_configure(
+    transformer.TransformerNoEncDecAttention)
 WideResnet = model_configure(resnet.WideResnet)
 Policy = model_configure(rl.Policy)
 PolicyAndValue = model_configure(rl.PolicyAndValue)
 Value = model_configure(rl.Value)
 RNNLM = model_configure(rnn.RNNLM)
-PositionLookupTransformerLM = model_configure(
-    position_lookup_transformer.PositionLookupTransformerLM)
+GRULM = model_configure(rnn.GRULM)
+LSTMSeq2SeqAttn = model_configure(rnn.LSTMSeq2SeqAttn)

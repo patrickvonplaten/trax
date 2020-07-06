@@ -1,4 +1,4 @@
-## Trax &mdash; your path to advanced deep learning
+## Trax &mdash; Deep Learning with Clear Code and Speed
 
 ![train tracks](https://images.pexels.com/photos/461772/pexels-photo-461772.jpeg?dl&fit=crop&crop=entropy&w=32&h=21)
 [![PyPI
@@ -9,11 +9,18 @@ Issues](https://img.shields.io/github/issues/google/trax.svg)](https://github.co
 welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-brightgreen.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Gitter](https://img.shields.io/gitter/room/nwjs/nw.js.svg)](https://gitter.im/trax-ml/community)
+[![Travis](https://img.shields.io/travis/google/trax.svg)](https://travis-ci.org/google/trax)
 
 
-[Trax](https://github.com/google/trax) helps you understand and explore advanced deep learning.
-We [focus](#structure) on making Trax code clear while pushing advanced models like
-[Reformer](https://github.com/google/trax/tree/master/trax/models/reformer) to their limits.
+[Trax](https://github.com/google/trax) is a library for deep learning that
+focuses on sequence models and reinforcement learning. It combines performance
+with code clarity and maintained documentation and tests.
+
+Trax includes basic models (like ResNet, LSTM, Transformer) and RL algorithms
+(like REINFORCE, A2C, PPO). It is also actively used for research and includes
+new models like the [Reformer](https://github.com/google/trax/tree/master/trax/models/reformer)
+and RL algorithms like [AWR](https://arxiv.org/abs/1910.00177).
+
 Trax is actively used and maintained in the [Google Brain team](https://research.google.com/teams/brain/).
 Give it a try, [talk to us](https://gitter.im/trax-ml/community)
 or [open an issue](https://github.com/google/trax/issues) if needed.
@@ -29,14 +36,20 @@ and has bindings to a large number of deep learning datasets, including
 It runs without any changes on CPUs, GPUs and TPUs.
 
 To see how to use Trax as a library, take a look at this [quick start colab](https://colab.research.google.com/github/google/trax/blob/master/trax/intro.ipynb)
-which explains how to create data in python, connect it to a Transformer model in Trax, train it and run inference.
-You can select a CPU or GPU runtime, or even get a free 8-core TPU as
-runtime. With TPUs in colab you need to set extra flags as demonstrated in these
+which explains how to:
+
+1. Create data in python.
+1. Connect it to a Transformer model in Trax.
+1. Train it and run inference.
+
+With Colab, you can select a CPU or GPU runtime, or even get a free 8-core TPU as
+runtime. Please note, with TPUs in colab you need to set extra flags as demonstrated in these
 [training](https://colab.research.google.com/github/google/trax/blob/master/trax/models/reformer/text_generation.ipynb)
 and [inference](https://colab.research.google.com/github/google/trax/blob/master/trax/models/reformer/image_generation.ipynb) colabs.
 
-To use Trax as a binary and not forget all the parameters (model type, learning
-rate, other hyper-paramters and training settings), we recommend [gin-config](https://github.com/google/gin-config).
+To use Trax as a binary, we recommend pairing your usage with [gin-config](https://github.com/google/gin-config)
+to keep track of model type, learning rate, and hyper-parameters or training settings.
+
 Take a look at [an example gin config](https://github.com/google/trax/blob/master/trax/configs/mlp_mnist.gin)
  for training a simple MLP on MNIST and run it as follows:
 
@@ -63,8 +76,8 @@ selected for oral presentation at [ICLR 2020](https://iclr.cc/Conferences/2020/)
 The main steps needed to understand deep learning correspond to sub-directories
 in Trax code:
 
-* [math/](https://github.com/google/trax/tree/master/trax/math) &mdash; basic math operations and ways to accelerate them on GPUs and TPUs (through [JAX](https://github.com/google/jax) and [TensorFlow](https://www.tensorflow.org/))
-* [layers/](https://github.com/google/trax/tree/master/trax/layers) are the basic building blocks of neural networks and here you'll find how they are build and all the needed ones
+* [fastmath/](https://github.com/google/trax/tree/master/trax/fastmath) &mdash; basic math operations and ways to accelerate them on GPUs and TPUs (through [JAX](https://github.com/google/jax) and [TensorFlow](https://www.tensorflow.org/))
+* [layers/](https://github.com/google/trax/tree/master/trax/layers) are the basic building blocks of neural networks and here you'll find how they are built and all the essentials
 * [models/](https://github.com/google/trax/tree/master/trax/models) contains all basic models (MLP, ResNet, Transformer, ...) and a number of new research models
 * [optimizers/](https://github.com/google/trax/tree/master/trax/optimizers) is a directory with optimizers needed for deep learning
 * [supervised/](https://github.com/google/trax/tree/master/trax/supervised) contains the utilities needed to run supervised learning and the Trainer class
@@ -83,5 +96,7 @@ problems with those, please report it and contribute a solution.
 We are still improving a few smaller parts of [layers](https://github.com/google/trax/tree/master/trax/layers),
 planning to update the [supervised](https://github.com/google/trax/tree/master/trax/supervised) API and
 heavily working on the [rl](https://github.com/google/trax/tree/master/trax/rl) part,
-so expect these parts to change over the next few months. We are also working hard
-to improve our documentation and examples and we welcome help with that.
+so expect these parts to change over the next few months.
+
+We are also working hard to improve our documentation and examples and we
+welcome help with that.

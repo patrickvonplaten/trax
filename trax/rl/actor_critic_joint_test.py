@@ -21,15 +21,20 @@ import functools
 from absl.testing import absltest
 
 from trax import layers as tl
-from trax import lr_schedules
 from trax import models
 from trax import optimizers as opt
+from trax import test_utils
 from trax.rl import actor_critic_joint
 from trax.rl import task as rl_task
+from trax.supervised import lr_schedules
 
 
 
 class ActorCriticJointTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    test_utils.ensure_flag('test_tmpdir')
 
   def test_awrjoint_save_restore(self):
     """Check save and restore of joint AWR trainer."""
@@ -46,7 +51,7 @@ class ActorCriticJointTest(absltest.TestCase):
         optimizer=opt.Adam,
         batch_size=4,
         train_steps_per_epoch=1,
-        collect_per_epoch=2,
+        n_trajectories_per_epoch=2,
         output_dir=tmp_dir)
     trainer1.run(2)
     self.assertEqual(trainer1.current_epoch, 2)
@@ -58,7 +63,7 @@ class ActorCriticJointTest(absltest.TestCase):
         optimizer=opt.Adam,
         batch_size=4,
         train_steps_per_epoch=1,
-        collect_per_epoch=2,
+        n_trajectories_per_epoch=2,
         output_dir=tmp_dir)
     trainer2.run(1)
     self.assertEqual(trainer2.current_epoch, 3)
@@ -70,14 +75,14 @@ class ActorCriticJointTest(absltest.TestCase):
   def test_jointppotrainer_cartpole(self):
     """Test-runs joint PPO on CartPole."""
 
-    task = rl_task.RLTask('CartPole-v0', initial_trajectories=100,
-                          max_steps=200)
+    task = rl_task.RLTask('CartPole-v0', initial_trajectories=0,
+                          max_steps=2)
     joint_model = functools.partial(
         models.PolicyAndValue,
-        body=lambda mode: tl.Serial(tl.Dense(64), tl.Relu()),
+        body=lambda mode: tl.Serial(tl.Dense(2), tl.Relu()),
     )
-    lr = lambda h: lr_schedules.MultifactorSchedule(  # pylint: disable=g-long-lambda
-        h, constant=1e-2, warmup_steps=100, factors='constant * linear_warmup')
+    lr = lambda: lr_schedules.multifactor(  # pylint: disable=g-long-lambda
+        constant=1e-2, warmup_steps=100, factors='constant * linear_warmup')
 
     trainer = actor_critic_joint.PPOJointTrainer(
         task,
@@ -86,7 +91,7 @@ class ActorCriticJointTest(absltest.TestCase):
         lr_schedule=lr,
         batch_size=4,
         train_steps_per_epoch=2,
-        collect_per_epoch=5)
+        n_trajectories_per_epoch=5)
     trainer.run(2)
     self.assertEqual(2, trainer.current_epoch)
 
@@ -98,8 +103,8 @@ class ActorCriticJointTest(absltest.TestCase):
         models.PolicyAndValue,
         body=lambda mode: tl.Serial(tl.Dense(64), tl.Relu()),
     )
-    lr = lambda h: lr_schedules.MultifactorSchedule(  # pylint: disable=g-long-lambda
-        h, constant=1e-2, warmup_steps=100, factors='constant * linear_warmup')
+    lr = lambda: lr_schedules.multifactor(  # pylint: disable=g-long-lambda
+        constant=1e-2, warmup_steps=100, factors='constant * linear_warmup')
     trainer = actor_critic_joint.AWRJointTrainer(
         task,
         joint_model=joint_model,
@@ -107,14 +112,35 @@ class ActorCriticJointTest(absltest.TestCase):
         lr_schedule=lr,
         batch_size=4,
         train_steps_per_epoch=2,
-        collect_per_epoch=5)
+        n_trajectories_per_epoch=5)
+    trainer.run(2)
+    self.assertEqual(2, trainer.current_epoch)
+
+  def test_jointa2ctrainer_cartpole(self):
+    """Test-runs joint A2C on cartpole."""
+    task = rl_task.RLTask('CartPole-v0', initial_trajectories=100,
+                          max_steps=200)
+    joint_model = functools.partial(
+        models.PolicyAndValue,
+        body=lambda mode: tl.Serial(tl.Dense(64), tl.Relu()),
+    )
+    lr = lambda: lr_schedules.multifactor(  # pylint: disable=g-long-lambda
+        constant=1e-2, warmup_steps=100, factors='constant * linear_warmup')
+    trainer = actor_critic_joint.A2CJointTrainer(
+        task,
+        joint_model=joint_model,
+        optimizer=opt.RMSProp,
+        lr_schedule=lr,
+        batch_size=2,
+        train_steps_per_epoch=1,
+        n_trajectories_per_epoch=1)
     trainer.run(2)
     self.assertEqual(2, trainer.current_epoch)
 
   def test_jointawrtrainer_cartpole_transformer(self):
     """Test-runs joint AWR on cartpole with Transformer."""
-    task = rl_task.RLTask('CartPole-v0', initial_trajectories=100,
-                          max_steps=200)
+    task = rl_task.RLTask('CartPole-v0', initial_trajectories=1,
+                          max_steps=2)
     body = lambda mode: models.TransformerDecoder(  # pylint: disable=g-long-lambda
         d_model=32, d_ff=32, n_layers=1, n_heads=1, mode=mode)
     joint_model = functools.partial(models.PolicyAndValue, body=body)
@@ -124,8 +150,25 @@ class ActorCriticJointTest(absltest.TestCase):
         optimizer=opt.Adam,
         batch_size=4,
         train_steps_per_epoch=2,
-        collect_per_epoch=2,
-        max_slice_length=128)
+        n_trajectories_per_epoch=2,
+        max_slice_length=2)
+    trainer.run(2)
+    self.assertEqual(2, trainer.current_epoch)
+
+  def test_jointa2ctrainer_cartpole_transformer(self):
+    """Test-runs joint A2C on cartpole with Transformer."""
+    task = rl_task.RLTask('CartPole-v0', initial_trajectories=100,
+                          max_steps=200)
+    body = lambda mode: models.TransformerDecoder(  # pylint: disable=g-long-lambda
+        d_model=32, d_ff=32, n_layers=1, n_heads=1, mode=mode)
+    joint_model = functools.partial(models.PolicyAndValue, body=body)
+    trainer = actor_critic_joint.A2CJointTrainer(
+        task,
+        joint_model=joint_model,
+        optimizer=opt.RMSProp,
+        batch_size=4,
+        train_steps_per_epoch=2,
+        n_trajectories_per_epoch=2)
     trainer.run(2)
     self.assertEqual(2, trainer.current_epoch)
 
